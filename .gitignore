@@ -1,0 +1,8 @@
+# build artifacts
+a2tp-srv
+a2tp-cli
+*.o
+
+# editor / OS noise
+*.swp
+*~
