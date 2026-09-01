@@ -67,9 +67,10 @@ ip netns exec "$NS_SRV" sysctl -qw net.ipv4.conf.all.rp_filter=0
 ip netns exec "$NS_SRV" sysctl -qw net.ipv4.conf.default.rp_filter=0
 # ...and keep it from ARP-flux answering for the tap's IP out of s0: with the
 # default arp_ignore=0 the kernel replies "tap-ip is-at <s0 mac>", which needs
-# no tunnel -- during a tcp outage it is the ONLY reply and poisons the LAN
-# peer's neighbor entry, so post-reconnect replies arrive as PACKET_OTHERHOST
-# on the tap and are dropped (the T7 reconnect check would hang forever)
+# no tunnel -- while the client is down it is the ONLY reply and poisons the
+# LAN peer's neighbor entry, so post-restart replies arrive as
+# PACKET_OTHERHOST on the tap and are dropped (the T4 roaming check would
+# hang forever)
 ip netns exec "$NS_SRV" sysctl -qw net.ipv4.conf.all.arp_ignore=1
 ip netns exec "$NS_SRV" sysctl -qw net.ipv4.conf.default.arp_ignore=1
 # the "LAN host" must emit plain wire frames: tso/gso off (no 64K super-frames)
@@ -164,61 +165,7 @@ else
     tail -n 5 "$SRV_LOG" "$CLI_LOG"
 fi
 
-# ---------- T6: --tcp transport (framed stream, kernel congestion control) ----
-kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; SRV_PID=""
-kill "$CLI_PID" 2>/dev/null; wait "$CLI_PID" 2>/dev/null; CLI_PID=""
-sleep 0.5
-ip netns exec "$NS_SRV" "$PWD/a2tp-srv" -i "$V_SRV" --tcp --bind 127.0.0.1 \
-    >>"$SRV_LOG" 2>&1 & SRV_PID=$!
-sleep 0.7
-ip netns exec "$NS_SRV" "$PWD/a2tp-cli" -s 127.0.0.1 --tcp --tap "$TAP" \
-    >>"$CLI_LOG" 2>&1 & CLI_PID=$!
-sleep 1
-ip -n "$NS_SRV" addr replace "$TAP_IP/24" dev "$TAP"
-CC=$(ip netns exec "$NS_SRV" ss -Htin "sport = :$SRV_PORT" 2>/dev/null | \
-    grep -oE 'bbr|cubic|reno' | head -1)
-[ -n "$CC" ] || CC=?
-if ip netns exec "$NS_SRV" ss -Htn "sport = :$SRV_PORT" | grep -q ESTAB \
-   && ip netns exec "$NS_SRV" ping -I "$TAP" -c 3 -W 2 "$LAN_IP" >/dev/null 2>&1; then
-    ok "T6 --tcp transport: framed stream carries the tunnel (kernel cc: $CC)"
-else
-    bad "T6 --tcp transport broken"
-    ip netns exec "$NS_SRV" ss -tn "sport = :$SRV_PORT"
-    tail -n 5 "$SRV_LOG" "$CLI_LOG"
-fi
-
-# ---------- T7: tcp reconnect (server dies; tap must stay up, only packets lost)
-if ip netns exec "$NS_SRV" ping -I "$TAP" -c 1 -W 2 "$LAN_IP" >/dev/null 2>&1; then
-    kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; SRV_PID=""
-    sleep 7   # client notices, tears down, starts the retry loop
-    if kill -0 "$CLI_PID" 2>/dev/null \
-       && ip -n "$NS_SRV" link show "$TAP" | grep -q ',UP' \
-       && ip -n "$NS_SRV" addr show "$TAP" | grep -q "$TAP_IP" \
-       && grep -q 'tcp connection lost, reconnecting' "$CLI_LOG" \
-       && ! ip netns exec "$NS_SRV" ping -I "$TAP" -c 1 -W 1 "$LAN_IP" >/dev/null 2>&1; then
-        TAP_STAYED_UP=1
-    else
-        TAP_STAYED_UP=0
-        bad "T7 client died / tap went down / no reconnect attempt during outage"
-        ip -n "$NS_SRV" -br link show "$TAP"; tail -n 5 "$CLI_LOG"
-    fi
-    ip netns exec "$NS_SRV" "$PWD/a2tp-srv" -i "$V_SRV" --tcp --bind 127.0.0.1 \
-        >>"$SRV_LOG" 2>&1 & SRV_PID=$!
-    sleep 6   # client's retry loop reconnects (<= 3 s backoff + connect)
-    if [ "$TAP_STAYED_UP" = 1 ] \
-       && kill -0 "$CLI_PID" 2>/dev/null \
-       && ip netns exec "$NS_SRV" ss -Htn "sport = :$SRV_PORT" | grep -q ESTAB \
-       && ip netns exec "$NS_SRV" ping -I "$TAP" -c 3 -W 2 "$LAN_IP" >/dev/null 2>&1; then
-        ok "T7 --tcp reconnect: tap stayed up across the outage, traffic resumed (packets lost, not state)"
-    elif [ "$TAP_STAYED_UP" = 1 ]; then
-        bad "T7 client did not re-establish after server restart"
-        ip netns exec "$NS_SRV" ss -tn "sport = :$SRV_PORT"; tail -n 5 "$SRV_LOG" "$CLI_LOG"
-    fi
-else
-    SKIP=$((SKIP+1)); say "SKIP: T7 needs a working T6 tunnel"
-fi
-
-# ---------- T8: --filter-ip (multi-IP NIC: only the client's IPs are tunneled) -
+# ---------- T6: --filter-ip (multi-IP NIC: only the client's IPs are tunneled) -
 kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; SRV_PID=""
 kill "$CLI_PID" 2>/dev/null; wait "$CLI_PID" 2>/dev/null; CLI_PID=""
 sleep 0.5
@@ -250,9 +197,9 @@ ip netns exec "$NS_SRV" ping -I "$TAP" -c 3 -W 2 "$LAN_IP" >/dev/null 2>&1 \
     && D=ok || D=fail
 
 if [ "$A" = ok ] && [ "$B" = ok ] && [ "$C" = ok ] && [ "$D" = ok ]; then
-    ok "T8 --filter-ip: $FIP tunneled, $SRV_IP stayed with the local stack (nothing on tap)"
+    ok "T6 --filter-ip: $FIP tunneled, $SRV_IP stayed with the local stack (nothing on tap)"
 else
-    bad "T8 --filter-ip: lan->filtered=$A lan->other=$B other-on-tap=$C tap->lan=$D"
+    bad "T6 --filter-ip: lan->filtered=$A lan->other=$B other-on-tap=$C tap->lan=$D"
     tail -n 5 "$SRV_LOG" "$CLI_LOG"
 fi
 

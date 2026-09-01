@@ -6,24 +6,18 @@
  *           and is injected there onto the NIC
  *
  * The result is a local TAP that behaves like the server's remote NIC.
+ * Keepalives keep the NAT mapping alive and let the server learn our
+ * endpoint before any real traffic; the server endpoint is re-learned from
+ * every incoming datagram (roaming).
  *
- * - UDP (default): keepalives keep the NAT mapping alive and let the server
- *   learn our endpoint before any real traffic; the server endpoint is
- *   re-learned from every incoming datagram (roaming).
- * - TCP (--tcp): framed stream with kernel congestion control and
- *   retransmission; automatic reconnect when the connection drops.
- *
- * Threading model (both transports): a rx thread pumps transport -> tap, a
- * tx thread pumps tap -> transport, a keepalive thread owns the liveness
- * timer.  Every pump blocks in its syscall -- no polling loop anywhere; the
- * kernel wakes a thread exactly when a frame arrives.  No locks: each send
- * is one syscall (sendto / sendmsg), which the kernel serializes on the
- * socket.  main owns the lifecycle only: it blocks on an event pipe until a
- * pump thread dies or a signal arrives, then tears down and, in tcp mode,
- * reconnects.
+ * Threading model: a rx thread pumps transport -> tap, a tx thread pumps
+ * tap -> transport, a keepalive thread owns the liveness timer.  Every pump
+ * blocks in its syscall -- no polling loop anywhere; the kernel wakes a
+ * thread exactly when a frame arrives.  No locks: each send is one sendto,
+ * which the kernel serializes on the socket.  main owns the lifecycle only:
+ * it blocks on an event pipe until a pump thread dies or a signal arrives.
  */
 #include "common.h"
-#include "auth.h"
 
 #include <fcntl.h>
 #include <getopt.h>
@@ -34,22 +28,14 @@
 #include <linux/if_ether.h>
 #include <linux/if_tun.h>
 
-/* how long to wait for the server's challenge before deciding the server
- * has no --pubkey and proceeding unauthenticated */
-#define AUTH_WAIT_MS 2000
-
 struct cfg {
     struct sockaddr_in srv;
     uint16_t local_port;
-    int tcp;                    /* --tcp: framed stream transport */
     const char *tap;
     uint8_t mac[6];
     int have_mac;
     int mtu;
     int keepalive_ms;
-    const char *privkey_path;   /* --privatekey file */
-    uint8_t seed[32];           /* loaded ed25519 seed */
-    int have_key;
 };
 
 static void usage(FILE *out)
@@ -59,20 +45,14 @@ static void usage(FILE *out)
         "\n"
         "  -s, --server <ip[:port]>  tunnel server (default port %d)\n"
         "  -p, --port <port>         local UDP port (default %d, 0 = ephemeral;\n"
-        "                            udp mode only, tcp uses an ephemeral port)\n"
+        "                            0 when server and client share a host)\n"
         "  -t, --tap <name>          TAP interface name (default a2tp0)\n"
-        "      --tcp                 framed TCP stream instead of UDP: kernel\n"
-        "                            congestion control and retransmission; the\n"
-        "                            server must be started with --tcp too\n"
         "      --up                  accepted for compatibility; the TAP is\n"
         "                            always brought up promiscuous (so mirrored\n"
         "                            frames to foreign MACs reach the stack)\n"
         "      --mac <aa:bb:..>      set the TAP MAC (e.g. clone the server NIC)\n"
         "      --mtu <n>             set the TAP MTU\n"
         "      --keepalive <s>       keepalive interval (default 10, 0 = off)\n"
-        "      --privatekey <file>   ssh ed25519 private key (openssh format,\n"
-        "                            no passphrase) to answer a --pubkey\n"
-        "                            server's challenge (tcp only)\n"
         "  -v, --verbose             per-packet logging\n"
         "  -h, --help                this help\n",
         A2TP_UDP_PORT, A2TP_UDP_PORT);
@@ -99,11 +79,10 @@ static int tap_open(const char *name)
 struct sh {
     struct cfg *cfg;
     int tfd;                    /* tap */
-    int xfd;                    /* transport socket (udp or tcp) */
-    int is_tcp;
+    int xfd;                    /* UDP transport socket */
     int ev_r, ev_w;             /* pump-death notifications to main */
-    uint64_t peer_k;            /* udp: current server endpoint (atomic) */
-    int dead;                   /* link down / teardown started (atomic) */
+    uint64_t peer_k;            /* current server endpoint (atomic) */
+    int dead;                   /* teardown started (atomic) */
 };
 
 static void mark_dead(struct sh *s)
@@ -123,7 +102,7 @@ static void rx_to_tap(int tfd, const uint8_t *frame, size_t flen)
     }
 }
 
-/* ---- rx: transport -> tap (blocks in recv; udp also refreshes the peer) -- */
+/* ---- rx: transport -> tap (blocks in recv; also refreshes the peer) ------ */
 
 static void *rx_udp_thread(void *arg)
 {
@@ -154,32 +133,6 @@ static void *rx_udp_thread(void *arg)
             rx_to_tap(s->tfd, buf + HDR_LEN, (size_t)r - HDR_LEN);
         else if (buf[0] != A2TP_TYPE_KEEPALIVE)
             logv("bad message type 0x%02x", buf[0]);
-    }
-    mark_dead(s);
-    return NULL;
-}
-
-static void *rx_tcp_thread(void *arg)
-{
-    struct sh *s = arg;
-    block_termination_signals();
-    uint8_t buf[2 + HDR_LEN + MAX_FRAME];   /* [len(2)][type][frame] */
-    struct stream_rx rx;
-    stream_rx_init(&rx, buf);
-
-    while (!g_stop && !__atomic_load_n(&s->dead, __ATOMIC_RELAXED)) {
-        int rc = stream_rx_feed(&rx, s->xfd);   /* blocks until a message */
-        if (rc < 0)
-            break;                              /* EOF / reset / bad frame */
-        if (rc == 0)
-            continue;
-        uint8_t *msg = rx.buf + 2;
-        size_t mlen = rx.have - 2;
-        if (msg[0] == A2TP_TYPE_DATA && mlen > HDR_LEN + ETH_HLEN)
-            rx_to_tap(s->tfd, msg + HDR_LEN, mlen - HDR_LEN);
-        else if (!(mlen == 1 && msg[0] == A2TP_TYPE_KEEPALIVE))
-            logv("bad message (type 0x%02x, %zu bytes)", msg[0], mlen);
-        stream_rx_next(&rx);
     }
     mark_dead(s);
     return NULL;
@@ -219,52 +172,16 @@ static void *tx_udp_thread(void *arg)
     return NULL;
 }
 
-static void *tx_tcp_thread(void *arg)
-{
-    struct sh *s = arg;
-    block_termination_signals();
-    uint8_t buf[2 + HDR_LEN + MAX_FRAME];   /* [len(2)][type][frame] */
-
-    while (!g_stop && !__atomic_load_n(&s->dead, __ATOMIC_RELAXED)) {
-        ssize_t r = read(s->tfd, buf + 2 + HDR_LEN, MAX_FRAME);
-        if (r < 0) {
-            if (errno == EINTR)
-                continue;
-            logmsg("tap read: %s", strerror(errno));
-            break;
-        }
-        if (r == 0)
-            break;
-        buf[2] = A2TP_TYPE_DATA;
-        if (stream_send_msg(s->xfd, buf + 2, HDR_LEN + (size_t)r) < 0) {
-            logv("send failed: %s", strerror(errno));
-            break;   /* connection is gone */
-        }
-        logv("tap->net %zd bytes", r);
-        if (g_verbose)
-            hexdump(buf + 2 + HDR_LEN, r, 24);
-    }
-    mark_dead(s);
-    return NULL;
-}
-
 /* ---- keepalive: owns the liveness timer (single send, no lock needed) ---- */
 
 static void keepalive_send(struct sh *s)
 {
     uint8_t ka = A2TP_TYPE_KEEPALIVE;
-    if (s->is_tcp) {
-        if (stream_send_msg(s->xfd, &ka, 1) < 0) {
-            logv("keepalive send: %s", strerror(errno));
-            mark_dead(s);
-        }
-    } else {
-        struct sockaddr_in peer;
-        key_to_sockaddr(__atomic_load_n(&s->peer_k, __ATOMIC_RELAXED), &peer);
-        if (sendto(s->xfd, &ka, 1, 0,
-                   (const struct sockaddr *)&peer, sizeof(peer)) < 0)
-            logv("keepalive send: %s", strerror(errno));
-    }
+    struct sockaddr_in peer;
+    key_to_sockaddr(__atomic_load_n(&s->peer_k, __ATOMIC_RELAXED), &peer);
+    if (sendto(s->xfd, &ka, 1, 0,
+               (const struct sockaddr *)&peer, sizeof(peer)) < 0)
+        logv("keepalive send: %s", strerror(errno));
 }
 
 static void *keepalive_thread(void *arg)
@@ -347,100 +264,6 @@ static int run_udp(struct cfg *cfg, int tfd)
     return 0;
 }
 
-/*
- * Answer the server's --pubkey challenge: sign its fresh 96-bit nonce
- * (u64 ms timestamp + u32 random) with our ed25519 key.  A server without
- * keys never challenges -- whatever arrives instead is real data (deliver
- * it) and a quiet wait just proceeds unauthenticated, so the same client
- * works against both.  0 = tunnel may start, -1 = connection is dead.
- */
-static int tcp_auth_respond(struct cfg *cfg, int cfd, int tfd)
-{
-    uint8_t buf[2 + HDR_LEN + MAX_FRAME];   /* a keyless server sends data */
-    struct stream_rx rx;
-    stream_rx_init(&rx, buf);
-    sock_rcvtimeo(cfd, AUTH_WAIT_MS);
-    int64_t deadline = now_ms() + AUTH_WAIT_MS;
-    int rc;
-    while ((rc = stream_rx_feed(&rx, cfd)) == 0)
-        if (g_stop || now_ms() >= deadline) { rc = -2; break; }
-    sock_rcvtimeo(cfd, 0);          /* the pump blocks for real again */
-    if (rc == -2) {
-        logmsg("server sent no challenge (no --pubkey there); "
-               "proceeding unauthenticated");
-        return 0;
-    }
-    if (rc < 0)
-        return -1;
-
-    uint8_t *msg = rx.buf + 2;
-    size_t mlen = rx.have - 2;
-    if (mlen == 1 + A2TP_CHALLENGE_LEN &&
-        msg[0] == A2TP_TYPE_AUTH_CHALLENGE) {
-        uint8_t resp[1 + A2TP_SIG_LEN] = { A2TP_TYPE_AUTH_RESPONSE };
-        if (ssh_sign(cfg->seed, msg + 1, A2TP_CHALLENGE_LEN, resp + 1) < 0)
-            return -1;
-        if (stream_send_msg(cfd, resp, sizeof(resp)) < 0)
-            return -1;
-        return 0;
-    }
-    /* not a challenge: the server does not authenticate, it is already
-     * sending -- hand the frame to the tap and carry on */
-    if (msg[0] == A2TP_TYPE_DATA && mlen > HDR_LEN + ETH_HLEN)
-        rx_to_tap(tfd, msg + HDR_LEN, mlen - HDR_LEN);
-    return 0;
-}
-
-static int run_tcp(struct cfg *cfg, int tfd)
-{
-    char srv_s[INET_ADDRSTRLEN] = "?";
-    inet_ntop(AF_INET, &cfg->srv.sin_addr, srv_s, sizeof(srv_s));
-
-    int ev[2];
-    if (evpipe_create(ev) < 0)
-        die("pipe");
-
-    while (!g_stop) {
-        logmsg("connecting to %s:%d (tcp)", srv_s, ntohs(cfg->srv.sin_port));
-        int cfd = tcp_connect_to(&cfg->srv, 5000);
-        if (cfd < 0) {
-            logmsg("connect failed: %s, retrying", strerror(errno));
-            for (int i = 0; i < 3 && !g_stop; i++)
-                sleep(1);
-            continue;
-        }
-
-        if (cfg->have_key && tcp_auth_respond(cfg, cfd, tfd) < 0) {
-            logmsg("rejected by server (auth), retrying");
-            close(cfd);
-            for (int i = 0; i < 3 && !g_stop; i++)
-                sleep(1);
-            continue;
-        }
-
-        struct sh s = { .cfg = cfg, .tfd = tfd, .xfd = cfd, .is_tcp = 1,
-                        .ev_r = ev[0], .ev_w = ev[1] };
-        pthread_t rx, tx, ka = 0;
-        if (pthread_create(&rx, NULL, rx_tcp_thread, &s) ||
-            pthread_create(&tx, NULL, tx_tcp_thread, &s) ||
-            (cfg->keepalive_ms > 0 && pthread_create(&ka, NULL, keepalive_thread, &s)))
-            die("pthread_create");
-
-        main_wait(&s);
-        int stopped = g_stop;
-        pump_teardown(&s, rx, tx, ka);
-        close(cfd);
-        if (stopped)
-            break;
-        logmsg("tcp connection lost, reconnecting");
-        for (int i = 0; i < 3 && !g_stop; i++)
-            sleep(1);
-    }
-
-    logmsg("shutting down");
-    return 0;
-}
-
 /* ======================================================================== */
 
 int main(int argc, char **argv)
@@ -451,18 +274,14 @@ int main(int argc, char **argv)
     cfg.tap = "a2tp0";
     cfg.keepalive_ms = 10000;
 
-    static int opt_tcp;   /* long-only flag, copied into cfg after parsing */
-
     static const struct option lopts[] = {
         {"server",    required_argument, 0, 's'},
         {"port",      required_argument, 0, 'p'},
         {"tap",       required_argument, 0, 't'},
-        {"tcp",       no_argument,       &opt_tcp, 1},
         {"up",        no_argument,       0, 'U'},
         {"mac",       required_argument, 0, 'm'},
         {"mtu",       required_argument, 0, 'M'},
         {"keepalive",   required_argument, 0, 'k'},
-        {"privatekey",  required_argument, 0, 1001},
         {"verbose",     no_argument,       0, 'v'},
         {"help",      no_argument,       0, 'h'},
         {0, 0, 0, 0},
@@ -470,7 +289,6 @@ int main(int argc, char **argv)
     int have_srv = 0, opt;
     while ((opt = getopt_long(argc, argv, "s:p:t:Um:M:k:vh", lopts, NULL)) != -1) {
         switch (opt) {
-        case 0:  break;   /* flag options (--tcp) */
         case 's':
             if (parse_ip_port(optarg, A2TP_UDP_PORT, &cfg.srv) < 0)
                 die("-s: expect ip[:port]");
@@ -486,7 +304,6 @@ int main(int argc, char **argv)
             break;
         case 'M': cfg.mtu = atoi(optarg); break;
         case 'k': cfg.keepalive_ms = atoi(optarg) * 1000; break;
-        case 1001: cfg.privkey_path = optarg; break;
         case 'v': g_verbose = 1; break;
         case 'h': usage(stdout); return 0;
         default:  usage(stderr); return 1;
@@ -496,23 +313,8 @@ int main(int argc, char **argv)
         usage(stderr);
         return 1;
     }
-    cfg.tcp = opt_tcp;
     if (strlen(cfg.tap) >= IFNAMSIZ)
         die("tap name too long");
-
-    if (cfg.privkey_path) {
-        if (!cfg.tcp)
-            die("--privatekey needs --tcp (the challenge handshake is "
-                "tcp-only)");
-        int rc = ssh_privkey_load(cfg.privkey_path, cfg.seed);
-        if (rc == -2)
-            die("%s: passphrase-encrypted keys are not supported",
-                cfg.privkey_path);
-        if (rc < 0)
-            die("%s: not an unencrypted openssh ed25519 key",
-                cfg.privkey_path);
-        cfg.have_key = 1;
-    }
 
     install_signal_handlers();
 
@@ -534,13 +336,10 @@ int main(int argc, char **argv)
     char srv_s[INET_ADDRSTRLEN] = "?";
     inet_ntop(AF_INET, &cfg.srv.sin_addr, srv_s, sizeof(srv_s));
 
-    logmsg("a2tp-cli tap %s (mac %02x:%02x:%02x:%02x:%02x:%02x, mtu %d), %s, "
+    logmsg("a2tp-cli tap %s (mac %02x:%02x:%02x:%02x:%02x:%02x, mtu %d), udp, "
            "server %s:%d", cfg.tap,
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], mtu,
-           cfg.tcp ? "tcp" : "udp", srv_s, ntohs(cfg.srv.sin_port));
+           srv_s, ntohs(cfg.srv.sin_port));
 
-    /* one dispatch at startup: the pump threads are transport-specific */
-    if (cfg.tcp)
-        return run_tcp(&cfg, tfd);
     return run_udp(&cfg, tfd);
 }

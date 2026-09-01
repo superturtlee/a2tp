@@ -1,7 +1,6 @@
 # build artifacts
 a2tp-srv
 a2tp-cli
-a2tp-cli.exe
 *.o
 
 # editor / OS noise

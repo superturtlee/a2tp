@@ -18,7 +18,6 @@ TAP=l2t-tap
 SRV_IP=10.9.0.1; LAN_IP=10.9.0.2; TAP_IP=10.9.0.20
 SRV_LOG=/tmp/a2tp-srv.log; CLI_LOG=/tmp/a2tp-cli.log
 T=${T:-5}    # seconds per iperf3 test
-TRANSPORT=${TRANSPORT:-udp}   # udp | tcp (tunnel transport under test)
 
 SRV_PID=""; CLI_PID=""; Iperf3_PID=""
 cleanup() {
@@ -63,7 +62,8 @@ ip -n "$NS_LAN" link set "$V_LAN" up; ip -n "$NS_LAN" link set lo up
 ip netns exec "$NS_SRV" sysctl -qw net.ipv4.conf.all.rp_filter=0
 ip netns exec "$NS_SRV" sysctl -qw net.ipv4.conf.default.rp_filter=0
 # s0 and the tap share one subnet in NS_SRV: no arp-flux answers for the tap's
-# IP out of s0 (see README -- they poison the LAN peer during a tcp outage)
+# IP out of s0 (see README -- while the client is down they poison the LAN
+# peer's neighbor entry)
 ip netns exec "$NS_SRV" sysctl -qw net.ipv4.conf.all.arp_ignore=1
 ip netns exec "$NS_SRV" sysctl -qw net.ipv4.conf.default.arp_ignore=1
 # the "LAN host" must emit plain wire frames: tso/gso off (no 64K super-frames
@@ -79,18 +79,16 @@ start_tunnel() {   # $1 = tap mtu (optional)
     local mtu=${1:-}
     local mtu_args=()
     [ -n "$mtu" ] && mtu_args=(--mtu "$mtu")
-    local tun_args=()
-    [ "$TRANSPORT" = tcp ] && tun_args=(--tcp)
     [ -n "$CLI_PID" ] && { kill "$CLI_PID" 2>/dev/null; wait "$CLI_PID" 2>/dev/null; CLI_PID=""; }
     sleep 0.3
     [ -z "$SRV_PID" ] && {
-        ip netns exec "$NS_SRV" "$PWD/a2tp-srv" -i "$V_SRV" "${tun_args[@]}" \
+        ip netns exec "$NS_SRV" "$PWD/a2tp-srv" -i "$V_SRV" \
             >"$SRV_LOG" 2>&1 &
         SRV_PID=$!
         sleep 0.5
     }
     ip netns exec "$NS_SRV" "$PWD/a2tp-cli" -s "$SRV_IP" -p 0 --tap "$TAP" \
-        "${mtu_args[@]}" "${tun_args[@]}" >>"$CLI_LOG" 2>&1 &
+        "${mtu_args[@]}" >>"$CLI_LOG" 2>&1 &
     CLI_PID=$!
     sleep 0.7
     # addressing/routing is this script's job, not the client's
@@ -113,7 +111,7 @@ fi
 
 # ---------- tunnel up ----------
 start_tunnel 1400
-echo "tunnel up ($TRANSPORT transport, tap mtu 1400); logs: $SRV_LOG $CLI_LOG"
+echo "tunnel up (tap mtu 1400); logs: $SRV_LOG $CLI_LOG"
 
 # ---------- latency ----------
 section "latency: ping through tunnel (tap <-> LAN)"
@@ -142,22 +140,17 @@ if [ "$HAVE_IPERF" -eq 1 ]; then
     fi
 
     section "TCP tap -> LAN, tap mtu 1500 (outer IP fragments every packet)"
-    if [ "$TRANSPORT" = udp ]; then
-        start_tunnel 1500
-        ip netns exec "$NS_SRV" iperf3 -B "$TAP_IP" -c "$LAN_IP" -t "$T" >/tmp/b5.txt 2>&1
-        report /tmp/b5.txt
-        echo "        (compare with the mtu-1400 run above: fragmentation cost)"
-    else
-        echo "        (skipped: over --tcp the outer never IP-fragments -- the stream
-        segments by MSS instead; compare the mtu-1400 run against the udp numbers)"
-    fi
+    start_tunnel 1500
+    ip netns exec "$NS_SRV" iperf3 -B "$TAP_IP" -c "$LAN_IP" -t "$T" >/tmp/b5.txt 2>&1
+    report /tmp/b5.txt
+    echo "        (compare with the mtu-1400 run above: fragmentation cost)"
 else
     section "fallback pps test: ping -f -s 1400 through tunnel, 5 s"
     timeout -s INT 5 ip netns exec "$NS_SRV" ping -I "$TAP" -f -s 1400 -c 100000 "$LAN_IP" 2>&1 | tail -2
 fi
 
 section "tunnel process log"
-grep -aE 'peer:|connected|udp local' "$SRV_LOG" | tail -n 8
+grep -aE 'peer:|udp local' "$SRV_LOG" | tail -n 8
 
 echo
 echo "done. logs: $SRV_LOG $CLI_LOG"

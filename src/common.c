@@ -4,12 +4,10 @@
 #include "common.h"
 
 #include <fcntl.h>
-#include <poll.h>
 #include <pthread.h>
 #include <time.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
-#include <netinet/tcp.h>
 #include <net/if.h>
 #include <net/if_arp.h>
 #include <netinet/in.h>
@@ -145,184 +143,6 @@ int udp_bind(uint32_t bind_ip, uint16_t local_port)
     return fd;
 }
 
-/* ---------- TCP transport ---------- */
-
-void tcp_tune(int fd)
-{
-    int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    /* congestion control is the kernel's business (set it via sysctl, e.g.
-     * net.ipv4.tcp_congestion_control=bbr) -- deliberately not touched here */
-
-    int bufsz = 4 << 20;
-    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof(bufsz));
-    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof(bufsz));
-    /* a stalled peer must not wedge the pump forever: give sends a deadline,
-     * then treat the connection as dead (a mid-message stall is fatal anyway) */
-    struct timeval tv = { .tv_sec = 30 };
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-}
-
-int tcp_listen_on(struct in_addr bind_addr, uint16_t port)
-{
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0)
-        return -1;
-    int one = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    struct sockaddr_in a = {0};
-    a.sin_family = AF_INET;
-    a.sin_addr = bind_addr;
-    a.sin_port = htons(port);
-    if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0 || listen(fd, 1) < 0) {
-        int err = errno;
-        close(fd);
-        errno = err;
-        return -1;
-    }
-    return fd;
-}
-
-int tcp_connect_to(const struct sockaddr_in *dst, int timeout_ms)
-{
-    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-    if (fd < 0)
-        return -1;
-    if (connect(fd, (const struct sockaddr *)dst, sizeof(*dst)) < 0 &&
-        errno != EINPROGRESS) {
-        int err = errno;
-        close(fd);
-        errno = err;
-        return -1;
-    }
-    struct pollfd p = { .fd = fd, .events = POLLOUT };
-    if (poll(&p, 1, timeout_ms) <= 0 || !(p.revents & POLLOUT)) {
-        close(fd);
-        errno = ETIMEDOUT;
-        return -1;
-    }
-    int err = 0;
-    socklen_t el = sizeof(err);
-    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) < 0 || err) {
-        close(fd);
-        errno = err ? err : EIO;
-        return -1;
-    }
-    /* back to blocking for the pump loop */
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags >= 0)
-        fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
-    tcp_tune(fd);
-    return fd;
-}
-
-/*
- * One sendmsg per message: length header + payload in a single syscall, so
- * concurrent writers on the same stream (data thread, keepalive thread) are
- * serialized by the socket lock and messages never interleave -- no mutex
- * needed.  The partial-send resume loop only runs if the kernel accepted
- * less than the whole message (needs a >4 MB backlog; practically never).
- */
-int stream_send_msg(int fd, const uint8_t *msg, size_t len)
-{
-    if (len < 1 || len > 0xffff) {
-        errno = EMSGSIZE;
-        return -1;
-    }
-    uint8_t hdr[2] = { (uint8_t)(len >> 8), (uint8_t)(len & 0xff) };
-    struct iovec full[2] = {
-        { .iov_base = hdr,          .iov_len = 2 },
-        { .iov_base = (void *)msg,  .iov_len = len },
-    };
-    size_t total = 2 + len, sent = 0, ioff = 0;
-    int idx = 0;
-
-    while (sent < total) {
-        struct iovec iov[2];
-        int n = 0;
-        if (idx < 2) {
-            iov[n].iov_base = (char *)full[idx].iov_base + ioff;
-            iov[n].iov_len = full[idx].iov_len - ioff;
-            n++;
-            if (idx + 1 < 2) {
-                iov[n] = full[idx + 1];
-                n++;
-            }
-        }
-        struct msghdr mh;
-        memset(&mh, 0, sizeof(mh));
-        mh.msg_iov = iov;
-        mh.msg_iovlen = (size_t)n;
-        ssize_t s = sendmsg(fd, &mh, MSG_NOSIGNAL);
-        if (s < 0) {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
-        sent += (size_t)s;
-        size_t adv = (size_t)s;
-        while (adv > 0 && idx < 2) {
-            size_t rem = full[idx].iov_len - ioff;
-            if (adv < rem) {
-                ioff += adv;
-                adv = 0;
-            } else {
-                adv -= rem;
-                idx++;
-                ioff = 0;
-            }
-        }
-    }
-    return 0;
-}
-
-void stream_rx_init(struct stream_rx *rx, uint8_t *buf)
-{
-    rx->buf = buf;
-    rx->have = 0;
-    rx->need = 2;
-    rx->hdr = 1;
-}
-
-void stream_rx_next(struct stream_rx *rx)
-{
-    rx->have = 0;
-    rx->need = 2;
-    rx->hdr = 1;
-}
-
-int stream_rx_feed(struct stream_rx *rx, int fd)
-{
-    for (;;) {
-        while (rx->have < rx->need) {
-            /* blocking recv: the reader thread sleeps in the kernel until a
-             * full message has assembled; sends are guarded by SO_SNDTIMEO */
-            ssize_t r = recv(fd, rx->buf + rx->have, rx->need - rx->have, 0);
-            if (r == 0) {           /* orderly close: connection over */
-                errno = ECONNRESET;
-                return -1;
-            }
-            if (r < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
-                    return 0;       /* drained for now */
-                return -1;
-            }
-            rx->have += (size_t)r;
-        }
-        if (rx->hdr) {
-            size_t len = ((size_t)rx->buf[0] << 8) | rx->buf[1];
-            if (len < 1) {          /* at least the type byte, always */
-                errno = EBADMSG;
-                return -1;
-            }
-            rx->need = 2 + len;
-            rx->hdr = 0;
-            continue;
-        }
-        return 1;                   /* message at buf[2 .. have) */
-    }
-}
-
 /*
  * No userspace checksum code: the TAP is opened without IFF_VNET_HDR and with
  * TUNSETOFFLOAD(0), so the kernel computes every checksum in software before
@@ -378,10 +198,10 @@ uint32_t frame_ipv4_dst(const uint8_t *f, size_t len)
 }
 
 /*
- * Walk Ethernet [+VLAN tags] -> IPv4 -> {UDP|TCP} and match the tunnel's own
+ * Walk Ethernet [+VLAN tags] -> IPv4 -> UDP and match the tunnel's own
  * 5-tuple. Only IPv4 is inspected (the tunnel itself is IPv4).
  */
-int frame_is_tunnel_l4(const uint8_t *f, size_t len, int proto,
+int frame_is_tunnel_l4(const uint8_t *f, size_t len,
                        uint16_t local_port, uint32_t peer_ip, uint16_t peer_port)
 {
     uint16_t et = 0;
@@ -396,7 +216,7 @@ int frame_is_tunnel_l4(const uint8_t *f, size_t len, int proto,
     size_t ihl = (size_t)(ip[0] & 0x0f) * 4;
     if (ihl < 20 || iplen < ihl + sizeof(struct udphdr))
         return 0;
-    if (ip[9] != proto)
+    if (ip[9] != IPPROTO_UDP)
         return 0;
 
     const struct iphdr *iph = (const struct iphdr *)ip;

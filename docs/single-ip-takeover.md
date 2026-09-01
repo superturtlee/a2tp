@@ -10,7 +10,7 @@
 LAN ────┤ eth0 / wlp8s0                     │          │  tap a2tp0           │
         │   192.168.1.101  ← 保留，host 自用 │   隧道    │   192.168.1.123/24   │
         │   192.168.1.123  ← ip addr del    │ ───────► │   (接管过来的 IP)     │
-        │        ▲                          │  UDP/TCP │                      │
+        │        ▲                          │   UDP    │                      │
         │        │ a2tp-srv --filter-ip .123│          │  a2tp-cli            │
         └────────┼──────────────────────────┘          └──────────┬───────────┘
                  │ 只镜像 dst=.123 的帧                            │
@@ -18,7 +18,7 @@ LAN ────┤ eth0 / wlp8s0                     │          │  tap a2tp
 ```
 
 本文以 `192.168.1.101`（保留）/ `192.168.1.123`（搬走）/ 网关 `192.168.1.1` 为例。
-全程有自动化测试背书：`testbed.sh` 的 T8（veth 实验室）与 `wifi-multiip.sh`
+全程有自动化测试背书：`testbed.sh` 的 T6（veth 实验室）与 `wifi-multiip.sh`
 （真实 WiFi，5 项断言）。
 
 ---
@@ -67,7 +67,7 @@ AF_PACKET socket 原样注入网卡，源 MAC 是 tap 的 MAC。
 
 1. **被接管的 IP 必须从 host 协议栈删除**（`ip addr del`）。留着会导致 host 内核
    也应答它的 ARP、也消费它的包——双主人。
-2. underlay（隧道本身的 UDP/TCP）不能依赖被接管的 IP。同机实验用 `--bind
+2. underlay（隧道本身的 UDP）不能依赖被接管的 IP。同机实验用 `--bind
    127.0.0.1`；跨机用网卡上**保留的** IP 或另一张网卡的 IP。
 3. `--filter-ip` 按 **IPv4 目的地址**匹配；IPv6 流量不在接管范围内（会被留在本机）。
 4. server 端 root/CAP_NET_RAW，client 端 root/CAP_NET_ADMIN。
@@ -92,7 +92,6 @@ cat /sys/class/net/wlp8s0/address
 
 sudo ./a2tp-srv -i wlp8s0 --filter-ip 192.168.1.123
 #   跨机时若网卡多 IP，建议 --bind <保留IP> 精确指定 underlay 监听地址
-#   需要内核重传/拥塞控制则双方加 --tcp
 ```
 
 ### client 端
@@ -144,7 +143,7 @@ mirror filter: ipv4 dst in {192.168.1.123} (arp passes, rest stays local)
 | WiFi 上完全不通 | tap 没克隆网卡 MAC → AP 不交付/丢弃注入帧；`--mac $(cat /sys/class/net/wlp8s0/address)` |
 | 通一下就断/时好时坏 | 同 netns 部署缺 `arp_ignore=1`（ARP flux 污染对端邻居表，见 README） |
 | 大流量全丢 | 网卡 offload：server 启动会自动关 tso/gso/gro（日志有记载）；流量源侧 veth 实验另需 `ethtool -K <if> tx off` |
-| client 换网后失联 | UDP 模式自动 NAT 漫游（每包重学对端）；TCP 模式 3 秒重连——等一个退避周期 |
+| client 换网后失联 | UDP 自动 NAT 漫游（每包重学对端），下一个 keepalive 到达即自愈——等一个 keepalive 周期 |
 | server 主机自己断网 | 与本功能无关的方向性问题：`--filter-ip` 不过滤的帧协议栈照常处理；先查 host 自身路由/ DHCP |
 
 ---
