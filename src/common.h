@@ -2,11 +2,9 @@
  * common.h - shared helpers for a2tp-srv / a2tp-cli
  *
  * A minimal L2TPv3-over-UDP style tunnel carrying raw Ethernet frames.
- * Wire format (simplified on purpose, not compatible with upstream L2TP):
- *
- *   UDP payload:
- *     u8 type    A2TP_TYPE_DATA      -> payload is one Ethernet frame
- *               A2TP_TYPE_KEEPALIVE  -> payload empty, refresh peer only
+ * The wire format lives in proto.h (shared with the Windows port): a u8
+ * message type -- data frame, keepalive, challenge, response -- with the
+ * framing details chosen by the transport (udp datagrams / tcp u16 prefix).
  */
 #ifndef A2TP_COMMON_H
 #define A2TP_COMMON_H
@@ -25,12 +23,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-#define A2TP_UDP_PORT      1702
-#define A2TP_TYPE_DATA      0x01
-#define A2TP_TYPE_KEEPALIVE 0x02
-
-#define MAX_FRAME   65536   /* max inner Ethernet frame (+ headroom for type byte) */
-#define HDR_LEN     1       /* sizeof(type field) */
+#include "proto.h"   /* wire format constants shared with the Windows port */
 
 /* global verbosity, set from -v in each program */
 extern int g_verbose;

@@ -23,6 +23,7 @@
  * reconnects.
  */
 #include "common.h"
+#include "auth.h"
 
 #include <fcntl.h>
 #include <getopt.h>
@@ -33,6 +34,10 @@
 #include <linux/if_ether.h>
 #include <linux/if_tun.h>
 
+/* how long to wait for the server's challenge before deciding the server
+ * has no --pubkey and proceeding unauthenticated */
+#define AUTH_WAIT_MS 2000
+
 struct cfg {
     struct sockaddr_in srv;
     uint16_t local_port;
@@ -42,6 +47,9 @@ struct cfg {
     int have_mac;
     int mtu;
     int keepalive_ms;
+    const char *privkey_path;   /* --privatekey file */
+    uint8_t seed[32];           /* loaded ed25519 seed */
+    int have_key;
 };
 
 static void usage(FILE *out)
@@ -62,6 +70,9 @@ static void usage(FILE *out)
         "      --mac <aa:bb:..>      set the TAP MAC (e.g. clone the server NIC)\n"
         "      --mtu <n>             set the TAP MTU\n"
         "      --keepalive <s>       keepalive interval (default 10, 0 = off)\n"
+        "      --privatekey <file>   ssh ed25519 private key (openssh format,\n"
+        "                            no passphrase) to answer a --pubkey\n"
+        "                            server's challenge (tcp only)\n"
         "  -v, --verbose             per-packet logging\n"
         "  -h, --help                this help\n",
         A2TP_UDP_PORT, A2TP_UDP_PORT);
@@ -101,9 +112,9 @@ static void mark_dead(struct sh *s)
         evpipe_notify(s->ev_w);
 }
 
-static void rx_to_tap(struct sh *s, const uint8_t *frame, size_t flen)
+static void rx_to_tap(int tfd, const uint8_t *frame, size_t flen)
 {
-    if (write(s->tfd, frame, flen) < 0)
+    if (write(tfd, frame, flen) < 0)
         logv("tap write: %s", strerror(errno));
     else {
         logv("net->tap %zu bytes", flen);
@@ -140,7 +151,7 @@ static void *rx_udp_thread(void *arg)
                    inet_ntoa(from.sin_addr), ntohs(from.sin_port));
         }
         if (buf[0] == A2TP_TYPE_DATA && r > HDR_LEN + ETH_HLEN)
-            rx_to_tap(s, buf + HDR_LEN, (size_t)r - HDR_LEN);
+            rx_to_tap(s->tfd, buf + HDR_LEN, (size_t)r - HDR_LEN);
         else if (buf[0] != A2TP_TYPE_KEEPALIVE)
             logv("bad message type 0x%02x", buf[0]);
     }
@@ -165,7 +176,7 @@ static void *rx_tcp_thread(void *arg)
         uint8_t *msg = rx.buf + 2;
         size_t mlen = rx.have - 2;
         if (msg[0] == A2TP_TYPE_DATA && mlen > HDR_LEN + ETH_HLEN)
-            rx_to_tap(s, msg + HDR_LEN, mlen - HDR_LEN);
+            rx_to_tap(s->tfd, msg + HDR_LEN, mlen - HDR_LEN);
         else if (!(mlen == 1 && msg[0] == A2TP_TYPE_KEEPALIVE))
             logv("bad message (type 0x%02x, %zu bytes)", msg[0], mlen);
         stream_rx_next(&rx);
@@ -336,6 +347,50 @@ static int run_udp(struct cfg *cfg, int tfd)
     return 0;
 }
 
+/*
+ * Answer the server's --pubkey challenge: sign its fresh 96-bit nonce
+ * (u64 ms timestamp + u32 random) with our ed25519 key.  A server without
+ * keys never challenges -- whatever arrives instead is real data (deliver
+ * it) and a quiet wait just proceeds unauthenticated, so the same client
+ * works against both.  0 = tunnel may start, -1 = connection is dead.
+ */
+static int tcp_auth_respond(struct cfg *cfg, int cfd, int tfd)
+{
+    uint8_t buf[2 + HDR_LEN + MAX_FRAME];   /* a keyless server sends data */
+    struct stream_rx rx;
+    stream_rx_init(&rx, buf);
+    sock_rcvtimeo(cfd, AUTH_WAIT_MS);
+    int64_t deadline = now_ms() + AUTH_WAIT_MS;
+    int rc;
+    while ((rc = stream_rx_feed(&rx, cfd)) == 0)
+        if (g_stop || now_ms() >= deadline) { rc = -2; break; }
+    sock_rcvtimeo(cfd, 0);          /* the pump blocks for real again */
+    if (rc == -2) {
+        logmsg("server sent no challenge (no --pubkey there); "
+               "proceeding unauthenticated");
+        return 0;
+    }
+    if (rc < 0)
+        return -1;
+
+    uint8_t *msg = rx.buf + 2;
+    size_t mlen = rx.have - 2;
+    if (mlen == 1 + A2TP_CHALLENGE_LEN &&
+        msg[0] == A2TP_TYPE_AUTH_CHALLENGE) {
+        uint8_t resp[1 + A2TP_SIG_LEN] = { A2TP_TYPE_AUTH_RESPONSE };
+        if (ssh_sign(cfg->seed, msg + 1, A2TP_CHALLENGE_LEN, resp + 1) < 0)
+            return -1;
+        if (stream_send_msg(cfd, resp, sizeof(resp)) < 0)
+            return -1;
+        return 0;
+    }
+    /* not a challenge: the server does not authenticate, it is already
+     * sending -- hand the frame to the tap and carry on */
+    if (msg[0] == A2TP_TYPE_DATA && mlen > HDR_LEN + ETH_HLEN)
+        rx_to_tap(tfd, msg + HDR_LEN, mlen - HDR_LEN);
+    return 0;
+}
+
 static int run_tcp(struct cfg *cfg, int tfd)
 {
     char srv_s[INET_ADDRSTRLEN] = "?";
@@ -350,6 +405,14 @@ static int run_tcp(struct cfg *cfg, int tfd)
         int cfd = tcp_connect_to(&cfg->srv, 5000);
         if (cfd < 0) {
             logmsg("connect failed: %s, retrying", strerror(errno));
+            for (int i = 0; i < 3 && !g_stop; i++)
+                sleep(1);
+            continue;
+        }
+
+        if (cfg->have_key && tcp_auth_respond(cfg, cfd, tfd) < 0) {
+            logmsg("rejected by server (auth), retrying");
+            close(cfd);
             for (int i = 0; i < 3 && !g_stop; i++)
                 sleep(1);
             continue;
@@ -398,8 +461,9 @@ int main(int argc, char **argv)
         {"up",        no_argument,       0, 'U'},
         {"mac",       required_argument, 0, 'm'},
         {"mtu",       required_argument, 0, 'M'},
-        {"keepalive", required_argument, 0, 'k'},
-        {"verbose",   no_argument,       0, 'v'},
+        {"keepalive",   required_argument, 0, 'k'},
+        {"privatekey",  required_argument, 0, 1001},
+        {"verbose",     no_argument,       0, 'v'},
         {"help",      no_argument,       0, 'h'},
         {0, 0, 0, 0},
     };
@@ -422,6 +486,7 @@ int main(int argc, char **argv)
             break;
         case 'M': cfg.mtu = atoi(optarg); break;
         case 'k': cfg.keepalive_ms = atoi(optarg) * 1000; break;
+        case 1001: cfg.privkey_path = optarg; break;
         case 'v': g_verbose = 1; break;
         case 'h': usage(stdout); return 0;
         default:  usage(stderr); return 1;
@@ -434,6 +499,20 @@ int main(int argc, char **argv)
     cfg.tcp = opt_tcp;
     if (strlen(cfg.tap) >= IFNAMSIZ)
         die("tap name too long");
+
+    if (cfg.privkey_path) {
+        if (!cfg.tcp)
+            die("--privatekey needs --tcp (the challenge handshake is "
+                "tcp-only)");
+        int rc = ssh_privkey_load(cfg.privkey_path, cfg.seed);
+        if (rc == -2)
+            die("%s: passphrase-encrypted keys are not supported",
+                cfg.privkey_path);
+        if (rc < 0)
+            die("%s: not an unencrypted openssh ed25519 key",
+                cfg.privkey_path);
+        cfg.have_key = 1;
+    }
 
     install_signal_handlers();
 

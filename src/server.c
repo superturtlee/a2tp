@@ -24,6 +24,7 @@
  * the transport.
  */
 #include "common.h"
+#include "auth.h"
 
 #include <getopt.h>
 #include <pthread.h>
@@ -33,6 +34,12 @@
 #include <linux/if_ether.h>
 
 #define FILTER_IP_MAX 32   /* --filter-ip addresses */
+#define PUBKEY_MAX     16  /* --pubkey authorized keys */
+
+/* how long a challenge may sit unanswered, and how far a response's
+ * challenge timestamp may have drifted when it is checked */
+#define AUTH_WAIT_MS  10000
+#define AUTH_FRESH_MS 30000
 
 struct cfg {
     const char *iface;
@@ -46,6 +53,9 @@ struct cfg {
     int keep_offloads;           /* don't touch tso/gso/gro on the NIC */
     uint32_t filter_ip[FILTER_IP_MAX];  /* --filter-ip: IPv4 dsts to mirror */
     int filter_n;
+    const char *pubkey_path;     /* --pubkey file (authorized_keys style) */
+    uint8_t pubkeys[PUBKEY_MAX][32];
+    int pubkeys_n;
 };
 
 /*
@@ -120,6 +130,11 @@ static void usage(FILE *out)
         "                           other frame stays with the local stack.\n"
         "                           Default: mirror everything, unfiltered\n"
         "      --keep-offloads      do not disable tso/gso/gro on the NIC\n"
+        "      --pubkey <file>      authorized_keys-style file of ssh-ed25519\n"
+        "                           public keys; every --tcp connection must\n"
+        "                           answer a challenge signed by one of them\n"
+        "                           (fresh 96-bit nonce each time: recorded\n"
+        "                           responses never verify twice)\n"
         "  -v, --verbose            per-packet logging\n"
         "  -h, --help               this help\n",
         A2TP_UDP_PORT);
@@ -412,6 +427,59 @@ static int mirror_tcp(struct sh *s)
     return 0;
 }
 
+/*
+ * Challenge-response gate for --pubkey (tcp): send a fresh 96-bit
+ * challenge -- u64 unix-ms + u32 random -- and demand a signature over it
+ * from one of the authorized keys.  A recorded response is worthless: it
+ * only verifies against its exact challenge, which the moving ms clock
+ * never reissues (same-millisecond replay needs a 2^-32 nonce collision,
+ * and is additionally bounded by the freshness window below).
+ *
+ * Returns the 1-based index of the key that signed, or -1.
+ */
+static int tcp_auth_challenge(struct cfg *cfg, int cfd)
+{
+    uint8_t chal[A2TP_CHALLENGE_LEN];
+    if (a2tp_challenge_build(chal, (uint64_t)now_ms()) < 0) {
+        logmsg("auth: entropy failure");
+        return -1;
+    }
+    uint8_t msg[1 + A2TP_CHALLENGE_LEN] = { A2TP_TYPE_AUTH_CHALLENGE };
+    memcpy(msg + 1, chal, sizeof(chal));
+    if (stream_send_msg(cfd, msg, sizeof(msg)) < 0)
+        return -1;
+
+    /* full-size buffer: the length prefix is read before it is validated,
+     * so the reader must be able to take the largest frame a peer sends */
+    uint8_t buf[2 + HDR_LEN + MAX_FRAME];
+    struct stream_rx rx;
+    stream_rx_init(&rx, buf);
+    sock_rcvtimeo(cfd, AUTH_WAIT_MS);
+    int64_t deadline = now_ms() + AUTH_WAIT_MS;
+    int rc;
+    while ((rc = stream_rx_feed(&rx, cfd)) == 0)
+        if (g_stop || now_ms() >= deadline) { rc = -1; break; }
+    sock_rcvtimeo(cfd, 0);          /* the pump blocks for real again */
+    if (rc < 0)
+        return -1;
+
+    uint8_t *ans = rx.buf + 2;
+    size_t alen = rx.have - 2;
+    if (alen != 1 + A2TP_SIG_LEN || ans[0] != A2TP_TYPE_AUTH_RESPONSE) {
+        logv("auth: bad answer (type 0x%02x, %zu bytes)", ans[0], alen);
+        return -1;
+    }
+    if ((uint64_t)(now_ms() - (int64_t)a2tp_challenge_ts(chal)) >
+        (uint64_t)AUTH_FRESH_MS) {
+        logv("auth: challenge drifted out of the freshness window");
+        return -1;
+    }
+    for (int i = 0; i < cfg->pubkeys_n; i++)
+        if (ssh_verify(cfg->pubkeys[i], chal, sizeof(chal), ans + 1) == 1)
+            return i + 1;
+    return -1;
+}
+
 static int run_tcp(struct cfg *cfg, int pfd, int ifindex)
 {
     int lfd = tcp_listen_on(cfg->bind_addr, cfg->port);
@@ -433,6 +501,19 @@ static int run_tcp(struct cfg *cfg, int pfd, int ifindex)
         tcp_tune(cfd);
         logmsg("client %s:%d connected (tcp)", inet_ntoa(who.sin_addr),
                ntohs(who.sin_port));
+
+        if (cfg->pubkeys_n > 0) {
+            int k = tcp_auth_challenge(cfg, cfd);
+            if (k < 0) {
+                logmsg("client %s:%d rejected (auth failed)",
+                       inet_ntoa(who.sin_addr), ntohs(who.sin_port));
+                close(cfd);
+                continue;
+            }
+            logmsg("client %s:%d authenticated (key %d of %d)",
+                   inet_ntoa(who.sin_addr), ntohs(who.sin_port),
+                   k, cfg->pubkeys_n);
+        }
 
         struct sh s = { .cfg = cfg, .pfd = pfd, .ifindex = ifindex, .xfd = cfd,
                         .peer_k = sockaddr_key(&who), .peer_known = 1 };
@@ -476,6 +557,7 @@ int main(int argc, char **argv)
         {"peer-timeout", required_argument, 0, 'T'},
         {"no-self-filter", no_argument,     0, 'F'},
         {"filter-ip",      required_argument, 0, 1001},
+        {"pubkey",         required_argument, 0, 1002},
         {"keep-offloads",  no_argument,     0, 'K'},
         {"verbose",      no_argument,       0, 'v'},
         {"help",         no_argument,       0, 'h'},
@@ -499,6 +581,7 @@ int main(int argc, char **argv)
         case 'T': cfg.peer_timeout_ms = atoi(optarg) * 1000; break;
         case 'F': cfg.self_filter = 0; break;
         case 1001: parse_filter_ips(&cfg, optarg); break;
+        case 1002: cfg.pubkey_path = optarg; break;
         case 'K': cfg.keep_offloads = 1; break;
         case 'v': g_verbose = 1; break;
         case 'h': usage(stdout); return 0;
@@ -512,6 +595,19 @@ int main(int argc, char **argv)
     cfg.tcp = opt_tcp;
     if (cfg.port == 0)
         die("invalid port");
+
+    if (cfg.pubkey_path) {
+        if (!cfg.tcp)
+            die("--pubkey needs --tcp (the challenge handshake is tcp-only)");
+        int n = ssh_pubkeys_load(cfg.pubkey_path, cfg.pubkeys, PUBKEY_MAX);
+        if (n < 0)
+            die("read %s: %s", cfg.pubkey_path, strerror(errno));
+        if (n == 0)
+            die("%s: no ssh-ed25519 keys found", cfg.pubkey_path);
+        cfg.pubkeys_n = n;
+        logmsg("auth: %d key(s) from %s, every tcp connection is challenged",
+               n, cfg.pubkey_path);
+    }
 
     install_signal_handlers();
 

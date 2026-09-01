@@ -23,6 +23,17 @@
 >      隧道端口的来源地址；
 >    - **隧道包裹**：用 wstunnel 等加密隧道包裹 a2tp 流量，server 侧
 >      `--bind 127.0.0.1` 只监听本机，使 a2tp 端口不直接暴露公网。
+> 3. **key 认证不是安全保证**：`--tcp --pubkey` 的挑战-应答（见"TCP 挑战认证"）
+>    **只验证 client 持有授权私钥，不加密、不防篡改任何数据**——它不能替代
+>    WireGuard/IPsec：
+>    - **数据面全程明文**：路径上的任何中间路由器/网关都可以审查（看穿隧道内
+>      全部流量）、修改（注入/篡改/重放内层帧，接收端无校验，照单全收注入网卡）
+>      隧道数据包；
+>    - **也不向 client 认证 server**：client 无法确认对端是真 server，中间人可以
+>      整体冒充；
+>    - 因此**必须保证 server 到物理网关的互联网链路可信**（如两端在同一内网、
+>      或链路本身受控），否则请套 WireGuard/IPsec，或退一步**在承载的内层应用
+>      使用 SSL/TLS**（内层流量自身加密，中间设备只能看到流量形态而非内容）。
 
 **A2tp**（**a**nother **l2tp**）：参照 Linux 内核
 `net/l2tp`（L2TPv3 over UDP 数据面）的思路实现的用户态 C 程序，一对进程把
@@ -54,7 +65,7 @@ LAN ────┤ eth0 (混杂模式)             │            │  tap a2tp
 | 数据面 | `SessionID(4)+Cookie(0/4/8)+[L2 sublayer]+L2帧` | `type(1B)+L2帧` |
 | 配置面 | netlink 静态配置 tunnel/session | 命令行参数，无 session 概念 |
 | 对端寻址 | tunnel socket 固定 connect | **每包学习/刷新对端 ip:port（NAT 漫游）** |
-| 认证/加密 | — | 无（见安全警告） |
+| 认证/加密 | — | TCP 挑战-应答（ssh ed25519 密钥，见下文）；数据面不加密 |
 
 封装格式（刻意简化，不与上游互通）：
 
@@ -64,12 +75,18 @@ UDP payload:  u8 type   0x01 = data（后跟一个完整以太网帧，含 VLAN 
 
 --tcp 模式下同一载荷改走 TCP 流，为字节流加帧界：
 TCP stream:   u16 be N，随后 N 字节（同样 u8 type + 载荷，N ≥ 1）
+
+--tcp + --pubkey 时，连接建立后先走挑战-应答（见"TCP 挑战认证"）：
+              0x03 = challenge（payload = u64 be unix-ms + u32 be 随机，共 12B）
+              0x04 = response（payload = 64B ed25519 签名，覆盖上述 12B）
 ```
 
 ## 编译与运行
 
 ```bash
-make                # 产出 a2tp-srv a2tp-cli（无第三方依赖，仅需内核头文件）
+make                # 产出 a2tp-srv a2tp-cli（依赖 OpenSSL libcrypto，需 libssl-dev）
+make check          # 认证模块自测（密钥解析 + 签名验签 + 与 openssl CLI 双向互操作）
+make a2tp-cli.exe   # 另有 Windows 客户端（见下文"Windows 客户端"）
 
 # server：接管 eth0（需要 root/CAP_NET_RAW）
 sudo ./a2tp-srv -i eth0
@@ -99,6 +116,7 @@ sudo ./a2tp-cli -s <server_ip> --tap a2tp0 \
 | `--no-self-filter` | 关闭"隧道自身 UDP 流量"过滤（默认过滤，防止隧道套隧道回声） |
 | `--filter-ip <ip[,ip..]>` | **多 IP 网卡模式**：只镜像 IPv4 目的地址为这些 IP 的帧（client 接管、已从本机协议栈删除的 IP；可重复/逗号分隔）。ARP 全部透传，其余帧留在本机协议栈。默认全镜像不过滤 |
 | `--keep-offloads` | 不动网卡的 tso/gso/gro（默认自动关闭、退出时恢复） |
+| `--pubkey <file>` | authorized_keys 格式的 ssh-ed25519 公钥文件（每行一个，可多把）。开启后**每条 TCP 连接**都要答挑战（见"TCP 挑战认证"）；需 `--tcp` |
 | `-v` | 逐帧日志（前 24 字节 hexdump） |
 
 ### a2tp-cli 选项
@@ -112,7 +130,73 @@ sudo ./a2tp-cli -s <server_ip> --tap a2tp0 \
 | `--mac <aa:bb:..>` | 设置 tap MAC（如复制 server 网卡 MAC） |
 | `--mtu <n>` | 设置 MTU（IP 地址与路由不归 client 管，用 `ip addr` / `ip route` 配置） |
 | `--keepalive <s>` | keepalive 间隔（默认 10s，0=关闭）。启动即发首包让 server 学到对端 |
+| `--privatekey <file>` | ssh ed25519 私钥（openssh 格式、无口令，即 `ssh-keygen -t ed25519` 产物）用于应答 server 的挑战；需 `--tcp` |
 | `-v` | 逐帧日志 |
+
+## TCP 挑战认证
+
+`--tcp` 模式下可用 ssh 格式 ed25519 密钥做挑战-应答认证（仅 Linux 端；UDP 模式
+无法安全承载握手，两侧都会拒绝密钥选项）：
+
+```bash
+ssh-keygen -t ed25519 -f a2tp_key -N ''            # 生成密钥对
+sudo ./a2tp-srv -i eth0 --tcp --pubkey a2tp_key.pub # server：authorized_keys 风格，可放多把公钥
+sudo ./a2tp-cli -s <server_ip> --tcp --privatekey a2tp_key
+```
+
+流程：server accept 后立刻发送 `0x03` 挑战——**u64 unix 毫秒时间戳 + u32 随机数
+共 96 bit**；client 必须在 10 秒内回 `0x04`：用私钥对这 12 字节做的 ed25519 签名
+（64 字节）。签名能被任一授权公钥验过，隧道才起；否则断开。密码学全部由
+OpenSSL libcrypto 完成（EVP ed25519 + `RAND_bytes`），本项目只解析 ssh 密钥容器。
+
+**防重放**：应答只对"签过字的那 12 字节"有效。重放一条录下的应答，需要 server
+恰好再次发出同一个挑战——u64 毫秒时间戳随时间单调推进，跨时间重发在构造上不可
+能；只剩同一毫秒内 u32 随机数碰撞（概率 2⁻³²），且 server 验证时还检查挑战时间
+戳未漂出 30 秒新鲜窗口（纵深防御，防伪造过期挑战签名）。每次连接挑战都不同，
+录制的应答永远验不过第二次。
+
+无密钥的 server（没给 `--pubkey`）不发起挑战；带 `--privatekey` 的 client 等 2 秒
+没有挑战就照常无认证建隧道（日志会注明），同一把 client 密钥两种 server 都能用。
+带公钥的 server 也会拒绝没有私钥的 client（含 Windows 客户端——它尚未实现应答）。
+认证只证明"client 持有授权私钥"，不加密数据面、也不向 client 认证 server。
+
+## Windows 客户端（a2tp-cli.exe）
+
+`src/client-win.c` 是 Windows 原生移植：线格式、UDP/TCP 双传输、keepalive、
+NAT 漫游与 Linux 版完全一致，直接对接同一个 Linux `a2tp-srv`。L2 后端是
+**tap-windows6** 驱动（OpenVPN 自带，ComponentId `tap0901`）。
+
+```bash
+make a2tp-cli.exe    # 交叉编译，需 x86_64-w64-mingw32-gcc；-static 无 DLL 依赖
+```
+
+以管理员身份在 Windows 控制台运行：
+
+```bat
+a2tp-cli.exe --list                       & REM 列出 TAP 适配器
+a2tp-cli.exe -s <server_ip> -t "a2tp-tap0" --mac aa:bb:cc:dd:ee:ff ^
+             --ip 192.168.1.123 --mask 255.255.255.0
+a2tp-cli.exe -s <server_ip> --tcp         & REM TCP 模式，断线自动重连
+```
+
+| Windows 专属选项 | 说明 |
+|---|---|
+| `-t <name\|guid>` | 按连接名或 GUID 选适配器（默认第一个 tap0901 适配器） |
+| `--list` | 列出 TAP 适配器后退出 |
+| `--mac` / `--mtu` | 写入注册表持久值；有变化时自动用 netsh 弹跳适配器一次使其生效 |
+| `--ip` / `--mask` / `--gw` | 便捷项：经 netsh 配静态 IPv4（不填则自己跑 netsh） |
+
+与 Linux 版的行为差异：
+
+- **无挑战应答**：暂不支持 `--privatekey`/挑战应答，连 `--pubkey` 的 server
+  会在认证一步被拒（Linux 端 TCP 认证见"TCP 挑战认证"）。
+- **适配器持久**：tap-windows6 适配器不随进程退出删除，退出时只把 media
+  status 置为"网线拔出"（干净下线）；`--mac/--mtu` 是注册表持久值。
+- **无混杂**：Windows 协议栈不会把镜像来的"发往第三方 MAC 的单播帧"送进
+  本机协议栈——顶替 IP 请用 `--mac` 克隆 server 网卡 MAC（对应
+  [docs/single-ip-takeover.md](docs/single-ip-takeover.md) 的接管模式）；
+  要嗅探全部镜像帧需 Npcap 之类抓包驱动绑定该适配器。
+- 外层 UDP 分片在 Windows 上默认允许（等效 `IP_PMTUDISC_DONT`），无需设置。
 
 ## 设计要点
 
@@ -174,14 +258,18 @@ sudo ./a2tp-cli -s <server_ip> --tap a2tp0 \
 - **MTU**：内层以太网帧 1514B + 外层 UDP/IP/以太网头 ≈ 1556B，超过 1500 时外层 IP
   自动分片（已设 `IP_PMTUDISC_DONT`）。对延迟敏感可在底层网络放大 MTU，或给 tap 设
   较小 MTU（如 1400）避免分片。
-- **安全警告**：无认证、无加密，任何知道 server 端口的人都能注入帧/收到镜像流量，
-  只可在可信网络使用；需要安全时套 WireGuard/IPsec 等（缓解措施见开头
+- **安全警告**：默认无认证、无加密，任何知道 server 端口的人都能注入帧/收到镜像
+  流量，只可在可信网络使用；`--tcp --pubkey` 可加 client 身份认证（见"TCP 挑战
+  认证"），但数据面仍不加密——需要机密性时套 WireGuard/IPsec 等（缓解措施见开头
   "法律声明与注意事项"）。
 
 ## 测试
 
 ```bash
+make check                      # 认证模块自测（无需 root）：密钥解析、签名/验签、
+                                 # socketpair 握手演练、防重放、与 openssl CLI 互操作
 sudo bash test/testbed.sh        # veth 实验室：8 项断言
+sudo bash test/auth.sh           # 挑战认证端到端：5 项断言（需 python3）
 sudo bash test/wifi.sh           # 真实 WiFi 网卡 + netns 纯 L2 联网：5 项断言
 sudo bash test/wifi-multiip.sh   # 真实 WiFi 多 IP：host 留 .101，client 接管 .123：5 项断言
 sudo bash test/bench.sh          # 吞吐/延迟测速（TRANSPORT=tcp 测 --tcp）
@@ -199,6 +287,15 @@ client 仍通；⑥ `--tcp` 传输：TCP 连接建立、ARP+ICMP 经成帧流过
 `--filter-ip` 多 IP 过滤：被过滤 IP 经隧道可达（ARP 透传由 client 应答）、网卡其余
 IP 仍由本机协议栈应答、且这些流量一帧都不出现在 tap 上。日志在
 `/tmp/a2tp-srv.log`、`/tmp/a2tp-cli.log`。
+
+### auth.sh（挑战认证端到端）
+
+同 testbed 的 veth 拓扑，server 以 `--tcp --pubkey` 启动，断言：A1 正确密钥被
+挑战、认证（日志显示第几把钥匙）且隧道通；A2 错误密钥每次重试都被拒、连接始终
+建立不起来、client 不退出持续重试；A3 无密钥 client 同样被拒；A4 无 `--pubkey`
+的 server 遇上带密钥 client——等不到挑战则照常无认证建隧道；A5 **重放攻击**：
+用授权私钥（openssl CLI 预签名）对一个时间戳落后 120 秒的过期挑战做合法签名
+发给 server，仍被拒绝且连接被断。日志在 `/tmp/a2tp-auth-e2e/`。
 
 ### wifi-multiip.sh（物理网卡多 IP 实战：一个 IP 搬给远端）
 
