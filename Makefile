@@ -1,16 +1,21 @@
 CC      ?= gcc
 CFLAGS  ?= -O2 -Wall -Wextra -std=c11 -D_GNU_SOURCE -pthread
-BINS     = a2tp-srv a2tp-cli
+BINS     = a2tpctl
+KDIR    ?= /lib/modules/$(shell uname -r)/build
 
 all: $(BINS)
 
-a2tp-srv: src/server.c src/common.c src/common.h src/proto.h
-	$(CC) $(CFLAGS) -o $@ src/server.c src/common.c
+a2tpctl: src/a2tpctl.c src/proto.h src/kapi.h
+	$(CC) $(CFLAGS) -o $@ src/a2tpctl.c
 
-a2tp-cli: src/client.c src/common.c src/common.h src/proto.h
-	$(CC) $(CFLAGS) -o $@ src/client.c src/common.c
+# kernel module (out-of-tree)
+kmod:
+	$(MAKE) -C $(KDIR) M=$(CURDIR)/kernel modules
 
-clean:
+kmod-clean:
+	$(MAKE) -C $(KDIR) M=$(CURDIR)/kernel clean
+
+clean: kmod-clean
 	rm -f $(BINS)
 
-.PHONY: all clean
+.PHONY: all clean kmod kmod-clean

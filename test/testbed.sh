@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 #
-# testbed.sh - end-to-end test for a2tp-srv / a2tp-cli.  Needs root.
+# testbed.sh - end-to-end test for the a2tp kernel module.  Needs root and
+# a2tp.ko loaded (sudo insmod kernel/a2tp.ko).
 #
 # Topology (no bridge anywhere; the server takes over a veth NIC):
 #
 #   netns l2t-srv                         netns l2t-lan
 #   ┌───────────────────────────┐         ┌──────────────┐
 #   │ l2t-s0 10.9.0.1/24 ══════╪═════════╪═ l2t-l0 10.9.0.2/24
-#   │   ▲ AF_PACKET promisc+inject         │   "LAN host" │
+#   │   ▲ rx_handler mirror+inject       │   "LAN host" │
 #   │   │                                 └──────────────┘
-#   │ a2tp-srv -i l2t-s0   (UDP :1702)
-#   │ a2tp-cli  tap l2t-tap 10.9.0.20/24  (UDP via lo to 10.9.0.1)
+#   │ a2tpctl srv add -i l2t-s0  (UDP :1702)
+#   │ a2tp0 (netdev l2t-tap) 10.9.0.20/24  (UDP via lo to 10.9.0.1)
 #   └───────────────────────────┘
 #
 # Every frame l2t-l0 sends must appear on the tap (mirror direction) and
@@ -28,16 +29,38 @@ FAKE_MAC=02:11:22:33:44:55; FAKE_IP=10.9.0.99
 SRV_LOG=/tmp/a2tp-srv.log; CLI_LOG=/tmp/a2tp-cli.log
 
 PASS=0; FAIL=0; SKIP=0
-SRV_PID=""; CLI_PID=""
 
 say()  { printf '%s\n' "$*"; }
 ok()   { say "PASS: $*"; PASS=$((PASS+1)); }
 bad()  { say "FAIL: $*"; FAIL=$((FAIL+1)); }
 skip() { say "SKIP: $*"; SKIP=$((SKIP+1)); }
 
+# ---------- instance helpers ----------
+srv_up() {  # extra args: a2tpctl srv add flags (-b, --filter-ip, ...)
+    ip netns exec "$NS_SRV" ./a2tpctl srv add -i "$V_SRV" "$@" >>"$SRV_LOG" 2>&1
+}
+srv_down() {
+    ip netns exec "$NS_SRV" ./a2tpctl srv del -i "$V_SRV" >>"$SRV_LOG" 2>&1
+}
+cli_up() {  # optional arg: remote address (default $SRV_IP)
+    local remote=${1:-$SRV_IP}
+    ip netns exec "$NS_SRV" ./a2tpctl cli add "$TAP" remote "$remote" \
+        local-port 0 >>"$CLI_LOG" 2>&1
+    ip -n "$NS_SRV" link set "$TAP" up
+    sleep 1
+    # addressing is the config script's job, not the client's
+    ip -n "$NS_SRV" addr replace "$TAP_IP/24" dev "$TAP"
+}
+cli_down() {
+    ip -n "$NS_SRV" link del "$TAP" 2>/dev/null
+}
+# learned peer "ip:port" from the kernel server instance
+peer() { ip netns exec "$NS_SRV" ./a2tpctl srv status \
+    | sed -n "s/^srv $V_SRV:.*peer learned \([0-9.]*:[0-9]*\).*/\1/p"; }
+
 cleanup() {
-    [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null
-    [ -n "$CLI_PID" ] && kill "$CLI_PID" 2>/dev/null
+    srv_down 2>/dev/null
+    cli_down 2>/dev/null
     sleep 0.3
     ip netns del "$NS_SRV" 2>/dev/null
     ip netns del "$NS_LAN" 2>/dev/null
@@ -48,6 +71,7 @@ trap cleanup EXIT
 [ "$(id -u)" -eq 0 ] || { say "must run as root: sudo bash test/testbed.sh"; exit 1; }
 make >/dev/null || { say "build failed"; exit 1; }
 command -v tcpdump >/dev/null || { say "tcpdump not found"; exit 1; }
+[ -d /sys/module/a2tp ] || { say "a2tp module not loaded: sudo insmod kernel/a2tp.ko"; exit 1; }
 
 # ---------- setup ----------
 ip netns del "$NS_SRV" 2>/dev/null; ip netns del "$NS_LAN" 2>/dev/null
@@ -81,17 +105,12 @@ command -v ethtool >/dev/null && \
     ip netns exec "$NS_LAN" ethtool -K "$V_LAN" tso off gso off gro off tx off 2>/dev/null
 say "topology up: $NS_SRV ($V_SRV $SRV_IP) <-> $NS_LAN ($V_LAN $LAN_IP)"
 
-ip netns exec "$NS_SRV" "$PWD/a2tp-srv" -i "$V_SRV" >"$SRV_LOG" 2>&1 &
-SRV_PID=$!
-ip netns exec "$NS_SRV" "$PWD/a2tp-cli" -s "$SRV_IP" -p 0 --tap "$TAP" \
-    >"$CLI_LOG" 2>&1 &
-CLI_PID=$!
-sleep 1
-# addressing is the config script's job, not the client's
-ip -n "$NS_SRV" addr replace "$TAP_IP/24" dev "$TAP"
+srv_up
+sleep 0.6
+cli_up
 
-say "--- server log ---";  cat "$SRV_LOG"
-say "--- client log ---";  cat "$CLI_LOG"
+say "--- server log ---";  tail -n 20 "$SRV_LOG"
+say "--- client log ---";  tail -n 20 "$CLI_LOG"
 
 # ---------- T1: bidirectional L2 pipe (ARP + ICMP both ways) ----------
 if ip netns exec "$NS_SRV" ping -I "$TAP" -c 3 -W 2 "$LAN_IP" >/tmp/t1.ping 2>&1; then
@@ -131,31 +150,27 @@ else
 fi
 
 # ---------- T4: NAT roaming (client comes back from a different port) ----------
-kill "$CLI_PID" 2>/dev/null; wait "$CLI_PID" 2>/dev/null; CLI_PID=""
+PEER_BEFORE=$(peer)
+cli_down
 sleep 0.5
-ip netns exec "$NS_SRV" "$PWD/a2tp-cli" -s "$SRV_IP" -p 0 --tap "$TAP" \
-    >>"$CLI_LOG" 2>&1 &
-CLI_PID=$!
-sleep 1
-ip -n "$NS_SRV" addr replace "$TAP_IP/24" dev "$TAP"
-if ip netns exec "$NS_SRV" ping -I "$TAP" -c 3 -W 2 "$LAN_IP" >/dev/null 2>&1 \
-   && grep -q 'peer:.*updated' "$SRV_LOG"; then
+cli_up
+ROAM=ok
+ip netns exec "$NS_SRV" ping -I "$TAP" -c 3 -W 2 "$LAN_IP" >/dev/null 2>&1 || ROAM=fail
+PEER_AFTER=$(peer)
+[ -n "$PEER_AFTER" ] && [ "$PEER_BEFORE" != "$PEER_AFTER" ] || ROAM=fail
+if [ "$ROAM" = ok ]; then
     ok "T4 peer re-learned after endpoint change (NAT roaming), tunnel still up"
 else
-    bad "T4 roaming failed"; tail -n 5 "$SRV_LOG"
+    bad "T4 roaming failed (before='$PEER_BEFORE' after='$PEER_AFTER')"
+    tail -n 5 "$SRV_LOG" "$CLI_LOG"
 fi
 
-# ---------- T5: --bind 127.0.0.1 (loopback-only listener serves local clients) ----------
-kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; SRV_PID=""
-kill "$CLI_PID" 2>/dev/null; wait "$CLI_PID" 2>/dev/null; CLI_PID=""
+# ---------- T5: loopback-only listener serves local clients ----------
+srv_down; cli_down
 sleep 0.5
-ip netns exec "$NS_SRV" "$PWD/a2tp-srv" -i "$V_SRV" --bind 127.0.0.1 \
-    >>"$SRV_LOG" 2>&1 & SRV_PID=$!
+srv_up -b 127.0.0.1
 sleep 0.7
-ip netns exec "$NS_SRV" "$PWD/a2tp-cli" -s 127.0.0.1 -p 0 --tap "$TAP" \
-    >>"$CLI_LOG" 2>&1 & CLI_PID=$!
-sleep 1
-ip -n "$NS_SRV" addr replace "$TAP_IP/24" dev "$TAP"
+cli_up 127.0.0.1
 if ip netns exec "$NS_SRV" ss -H -uln "sport = :$SRV_PORT" | grep -q "127.0.0.1:$SRV_PORT" \
    && ip netns exec "$NS_SRV" ping -I "$TAP" -c 3 -W 2 "$LAN_IP" >/dev/null 2>&1; then
     ok "T5 server bound to 127.0.0.1 only: socket listens on loopback, local client works"
@@ -166,16 +181,12 @@ else
 fi
 
 # ---------- T6: --filter-ip (multi-IP NIC: only the client's IPs are tunneled) -
-kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; SRV_PID=""
-kill "$CLI_PID" 2>/dev/null; wait "$CLI_PID" 2>/dev/null; CLI_PID=""
+srv_down; cli_down
 sleep 0.5
 FIP=10.9.0.3   # "second IP of the NIC", owned only by the client's tap
-ip netns exec "$NS_SRV" "$PWD/a2tp-srv" -i "$V_SRV" --filter-ip "$FIP" \
-    >>"$SRV_LOG" 2>&1 & SRV_PID=$!
+srv_up --filter-ip "$FIP"
 sleep 0.7
-ip netns exec "$NS_SRV" "$PWD/a2tp-cli" -s "$SRV_IP" -p 0 --tap "$TAP" \
-    >>"$CLI_LOG" 2>&1 & CLI_PID=$!
-sleep 1
+cli_up
 ip -n "$NS_SRV" addr replace "$FIP/24" dev "$TAP"
 ip -n "$NS_SRV" route replace "$LAN_IP/32" dev "$TAP" src "$FIP"
 

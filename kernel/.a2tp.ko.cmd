@@ -1,0 +1,1 @@
+savedcmd_a2tp.ko := ld -r -m elf_x86_64 -z noexecstack --no-warn-rwx-segments --build-id=sha1  -T /usr/src/linux-headers-7.0.0-30-generic/scripts/module.lds -o a2tp.ko a2tp.o a2tp.mod.o .module-common.o
