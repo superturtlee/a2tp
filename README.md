@@ -30,8 +30,20 @@
 >      自身加密，中间设备只能看到流量形态而非内容）。
 
 **A2tp**（**a**nother **l2tp**）：参照 Linux 内核
-`net/l2tp`（L2TPv3 over UDP 数据面）的思路实现的用户态 C 程序，一对进程把
-server 上的一块网卡完整"搬"到 client 本地（server 网卡镜像 / client TAP 克隆）：
+`net/l2tp`（L2TPv3 over UDP 数据面）的思路实现的 L2 透传，一对端点把 server 上的
+一块网卡完整"搬"到 client 本地（server 网卡镜像 / client TAP 克隆）。
+
+**同一套线协议（UDP 1702，`type(1B)+以太网帧`）有两种实现，可任意交叉对接**：
+
+| 实现 | 数据面 | 配置面 | 适用 |
+|---|---|---|---|
+| 用户态（`a2tp-srv`/`a2tp-cli`） | AF_PACKET + TAP，每帧 2 syscall | 命令行参数 | 调试/对照/回退，无需 root 内核模块 |
+| **内核模块（`a2tp.ko` + `a2tpctl`）** | rx_handler 镜像 + rtnl netdev，全程不出内核 | genl + rtnl_link | 生产：吞吐/延迟 + IPv6 + 叠 wg/IPsec |
+
+内核版文档（架构、a2tpctl 参考、IPv6、可靠性契约、权限矩阵、wg/IPsec 叠加、
+部署约束）：**[docs/kernel.md](docs/kernel.md)**。
+
+用户态版架构：
 
 ```
                 server 主机                                 client 主机
@@ -71,8 +83,18 @@ UDP payload:  u8 type   0x01 = data（后跟一个完整以太网帧，含 VLAN 
 ## 编译与运行
 
 ```bash
-make                # 产出 a2tp-srv a2tp-cli（无第三方依赖，只需 glibc）
+make                # 用户态：a2tp-srv a2tp-cli（无第三方依赖，只需 glibc）
+make kmod           # 内核模块：kernel/a2tp.ko（需要内核 headers）
+make a2tpctl        # 内核版控制工具（零依赖）
 
+# ── 内核版（生产推荐，详见 docs/kernel.md）──────────────────────────
+sudo modprobe udp_tunnel && sudo modprobe ip6_udp_tunnel
+sudo insmod kernel/a2tp.ko
+sudo ./a2tpctl srv add -i eth0                 # server：接管 eth0（CAP_NET_ADMIN）
+sudo ./a2tpctl cli add a2tp0 remote <server_ip>   # client：本地出现 a2tp0
+sudo ip link set a2tp0 up && sudo ip addr add 192.168.1.123/24 dev a2tp0
+
+# ── 用户态版（对照/回退）──────────────────────────────────────────
 # server：接管 eth0（需要 root/CAP_NET_RAW）
 sudo ./a2tp-srv -i eth0
 
@@ -146,7 +168,7 @@ sudo ./a2tp-cli -s <server_ip> --tap a2tp0 \
   正确应答后到、覆盖），但 **client 离线期间只有内核代答**，对端邻居表被污染成 server
   网卡 MAC，client 重启后回包对 tap 是 `PACKET_OTHERHOST` 而被静默丢弃且无法自愈。同
   netns 跑就 `sysctl net.ipv4.conf.all.arp_ignore=1`；server 与 tap 分属不同 netns
-  （如 wifi.sh 拓扑）则天然免疫。
+  （如真实跨机部署）则天然免疫。
 - **防环**：① 注入用同一个 AF_PACKET socket，发送不自环，且设置
   `PACKET_IGNORE_OUTGOING` 并丢弃 `PACKET_OUTGOING`，本机流量不会被镜像回来；
   ② 镜像前过滤与隧道自身五元组匹配的 IPv4/UDP 帧，防止"隧道套隧道"回声。
@@ -158,7 +180,7 @@ sudo ./a2tp-cli -s <server_ip> --tap a2tp0 \
     真实网卡方向由硬件在帧上线前完成。**veth 实验拓扑例外**：veth 的
     tx-checksumming 会把 `CHECKSUM_PARTIAL` 占位帧原样交给对端（AF_PACKET 抓包点
     和协议栈都会静默丢弃），必须在**流量源**`ethtool -K <if> tx off` 根治
-    （testbed.sh / bench.sh 已内置）。
+    （testbed.sh 已内置）。
   - *tso/gso/gro*：GRO 在抓包点之前把帧合并成 64KB 超级帧——那不是线上的帧，
     且超过 UDP 单包上限 65507，TCP 过隧道会全灭。server 启动时自动关闭网卡的
     tso/gso/gro，**退出时恢复原值**（`--keep-offloads` 可保留不碰）。
@@ -171,55 +193,50 @@ sudo ./a2tp-cli -s <server_ip> --tap a2tp0 \
 
 ## 测试
 
+内核模块的测试**一律在 QEMU 一次性 overlay VM 沙箱里跑**（宿主机从不 insmod——
+早期在宿主上加载模块打崩过网络栈；沙箱 `tools/qemu-vm.sh`，首次
+`fetch && bake`，VM 经 9p 挂载本仓库）：
+
 ```bash
-sudo bash test/testbed.sh        # veth 实验室：6 项断言
-sudo bash test/wifi.sh           # 真实 WiFi 网卡 + netns 纯 L2 联网：5 项断言
-sudo bash test/wifi-multiip.sh   # 真实 WiFi 多 IP：host 留 .101，client 接管 .123：5 项断言
-sudo bash test/bench.sh          # 吞吐/延迟测速
+./test/qemu.sh testbed    # T1-T10：数据面功能矩阵
+./test/qemu.sh wg         # W1-W4：WireGuard 承载可靠性
+./test/qemu.sh xfrm       # X1-X3：IPsec 承载
+./test/qemu.sh caps       # C1-C5：CAP_NET_ADMIN × userns 权限矩阵
+./test/qemu.sh sh '<cmd>' # 沙箱内任意命令
 ```
 
-### testbed.sh（veth 实验室，无 bridge）
+全部 27 项断言当前全绿（10+6+4+7）。
 
-在两个 network namespace 间搭一对 veth，server 直接接管 veth 网卡，断言：
-① tap↔对端双向 ping（ARP+ICMP 全走隧道）；② 发往无关 MAC 的单播帧被镜像到 tap
-（混杂）；③ 线上 echo request/reply 恰好 3/3（无环路无风暴）；④ client 换端口重连后
-server 重新学习对端（NAT 漫游）；⑤ `--bind 127.0.0.1` 时 socket 实际只听环回、本机
-client 仍通；⑥ `--filter-ip` 多 IP 过滤：被过滤 IP 经隧道可达（ARP 透传由 client
-应答）、网卡其余 IP 仍由本机协议栈应答、且这些流量一帧都不出现在 tap 上。日志在
-`/tmp/a2tp-srv.log`、`/tmp/a2tp-cli.log`。
+### testbed.sh（veth 实验室，无 bridge）— T1-T10
 
-### wifi-multiip.sh（物理网卡多 IP 实战：一个 IP 搬给远端）
+两个 netns 间一对 veth，server 直接接管 veth 网卡：T1 双向 ping（ARP+ICMP 全走
+隧道）；T2 发往无关 MAC 的单播帧被镜像（混杂）；T3 线上 echo 恰好 3/3（无环无
+风暴）；T4 client 换端口重连后 server 重学对端（NAT 漫游）；T5 `--bind 127.0.0.1`
+只听环回且本机 client 可用；T6 `--filter-ip` 多 IP 过滤（被滤 IP 走隧道、其余 IP
+留本机且一帧不上 tap）；T7 v6 传输（外层 UDP over v6 + NDP/ICMPv6 内层）；T8
+`--filter-ip6` 地址式掩码过滤；T9 承载地址被删：流量停、实例活、恢复即续；T10
+默认路由跳变（断"WiFi"换"网线"）：客户端零配置换源地址，同一 server 实例重学
+对端。日志在 `/tmp/a2tp-srv.log`、`/tmp/a2tp-cli.log`。
 
-server 接管物理 WiFi 网卡并用 `--filter-ip` 只镜像被接管的 IP（该 IP 先从 host 协议栈
-删除，脚本退出自动还原；若 IP 原不在 host 上则探测空闲后直接使用）。client 住在
-netns 里，tap 克隆 WiFi 网卡 MAC 并占用被接管的 IP。断言：M1 host 自己的 IP
-（192.168.1.101）照常上互联网；M2 被接管 IP（192.168.1.123）经隧道上互联网
-（ARP 透传 + 过滤镜像）；M3/M4 DNS 与 HTTP 200；M5 host 的流量一帧都不泄漏到 tap。
-用法：`sudo bash test/wifi-multiip.sh [iface] [ip]`。
+### wg.sh（WireGuard 承载可靠性）— W1-W4
 
-### wifi.sh（物理网卡实战：netns 纯 L2 联网）
+三 netns：a2tp 外层 UDP 整体跑在 wg0 里（client remote 填 server 的 wg overlay
+地址）。W1 隧道过 wg 通、底层抓包只有 wg 密文无明文 udp/1702、server 学到 overlay
+端点；W2 未 pin 断连（client `ip link wg0 down`）：流量停、双端实例活、恢复自愈；
+W3 server pin（`-b <wg ip>`）后删该地址：镜像尝试计入 `tx_err`、实例活、恢复自愈；
+W4 client pin（`local <wg ip>`）后删该地址：静默等待、恢复自愈。密钥须放在
+`/etc/wireguard/` 下（Ubuntu 的 wg(8) AppArmor profile 只允许读那里的私钥）。
 
-server 在 root netns 接管**物理 WiFi 网卡**（默认 `wlp8s0`）；client 与 tap 住在
-netns `l2t-wifi` 里，tap 克隆 WiFi 网卡的 MAC（802.11 managed 模式只交付发给自己
-MAC 的单播，克隆 MAC 才能收到网关回包），占用 WiFi 子网中的一个空闲 IP。隧道的
-UDP 走一对专用 veth 底座（MTU 2000，内外分离），其余一切字节都通过克隆链路出现在
-**真实 WiFi LAN** 上：
+### xfrm.sh（IPsec 承载）— X1-X3
 
-```
-root ns:  a2tp-srv -i wlp8s0 ◄─ UDP 底座(veth) ─► a2tp-cli (netns) ─ wifi0(tap)
-                └── 真实 WiFi L2 透传：ARP/DNS/ICMP/HTTP ──► 路由器 ──► 互联网
-```
+传输模式 ESP 保护外层：底层只见 ESP；删策略后出现明文 udp/1702（证明 X1 的断言
+是真的）；隧道本身不依赖 IPsec，无策略也通。
 
-断言：W1 server 学到对端；W2 netns→真实网关 ping；W3 netns→公网 223.5.5.5；
-W4 DNS；W5 HTTP 200。脚本自动处理两个环境坑：底座 veth 两侧 `ethtool -K tx off`
-（veth 校验和伪影），以及把底座接口临时加入 firewalld trusted zone（默认 zone 丢弃
-入站 UDP 但放行 ping，只改运行时配置、退出还原）。
+### caps.sh（权限矩阵）— C1-C5
 
-### bench.sh（测速）
-
-基线直连 veth 对照，随后经隧道：ping 延迟、TCP 双向（tap→LAN 注入路径 / -R 镜像
-路径）、UDP 1370B 定速、64B 小包 pps、tap MTU 1500 时的外层分片代价。iperf3 服务端
-全程常驻避免端口竞争。`T=<秒>` 调每个 iperf 时长。
+普通用户 / 真 root / root 剥 CAP_NET_ADMIN / userns 假 root 侵初始 netns /
+userns 假 root 自建 netns。前四者 admin 操作全部 EPERM（`srv status` 保持可读），
+最后一种放行（容器部署姿势）。详见 [docs/kernel.md](docs/kernel.md) 的权限模型。
 
 ## 扩展方向
 

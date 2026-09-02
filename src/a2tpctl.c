@@ -40,7 +40,6 @@
 #include "kapi.h"
 #include "proto.h"	/* wire format constants: A2TP_UDP_PORT */
 
-#define A2TP_FILTER_IP_MAX	32
 
 /* ---------------- small helpers ---------------- */
 
@@ -87,33 +86,175 @@ static void logv(const char *fmt, ...)
 	fputc('\n', stderr);
 }
 
-/* parse "1.2.3.4:1702" (":1702" and "1.2.3.4" also accepted -> def port) */
-static int parse_ip_port(const char *s, uint16_t def_port,
-			 struct sockaddr_in *out)
+/* ---------------- dual-family addresses ---------------- */
+
+struct xaddr {
+	int		family;		/* AF_INET / AF_INET6 / AF_UNSPEC */
+	union {
+		uint32_t	v4;	/* network order */
+		uint8_t		v6[16];
+	};
+};
+
+/* parse "1.2.3.4:1702", "1.2.3.4", "[fd00::1]:1702" or "fd00::1";
+ * v6-with-port requires the brackets (same rule as ssh / iproute2).
+ * def_port is used when none is given; *port_be gets the network-order
+ * port */
+static int parse_addr_port(const char *s, uint16_t def_port,
+			   struct xaddr *a, uint16_t *port_be)
 {
-	char buf[256];
-	char *colon;
+	char buf[256], *host, *serv = NULL;
 	long port = def_port;
+	int colons = 0;
+	const char *c;
 
 	if (!s || !*s)
 		return -1;
 	snprintf(buf, sizeof(buf), "%s", s);
-	colon = strrchr(buf, ':');
-	if (colon) {
+	if (buf[0] == '[') {
+		char *rb = strchr(buf, ']');
+
+		if (!rb)
+			return -1;
+		*rb = '\0';
+		host = buf + 1;
+		if (rb[1] == ':')
+			serv = rb + 2;
+		else if (rb[1])
+			return -1;
+	} else {
+		for (c = buf; *c; c++)
+			colons += (*c == ':');
+		if (colons == 1) {
+			/* single colon: v4 "ip:port" (bare v6 has >= 2) */
+			host = buf;
+			serv = strchr(buf, ':');
+			*serv++ = '\0';
+		} else {
+			host = buf;
+		}
+	}
+	if (serv && *serv) {
 		char *end = NULL;
 
-		*colon = '\0';
-		port = strtol(colon + 1, &end, 10);
+		port = strtol(serv, &end, 10);
 		if (!end || *end || port < 0 || port > 65535)
 			return -1;
-		if (!*buf)
+	}
+
+	memset(a, 0, sizeof(*a));
+	if (inet_pton(AF_INET, host, &a->v4) == 1)
+		a->family = AF_INET;
+	else if (inet_pton(AF_INET6, host, a->v6) == 1)
+		a->family = AF_INET6;
+	else
+		return -1;
+	*port_be = htons((uint16_t)port);
+	return 0;
+}
+
+/* bare address, no port allowed (e.g. -b, cli local) */
+static int parse_addr(const char *s, struct xaddr *a)
+{
+	uint16_t port_be;
+
+	if (parse_addr_port(s, 0, a, &port_be) < 0 || port_be)
+		return -1;
+	return 0;
+}
+
+static const char *addr_str(const struct xaddr *a, char *buf, size_t n)
+{
+	if (a->family == AF_INET) {
+		struct in_addr in;
+
+		in.s_addr = a->v4;
+		inet_ntop(AF_INET, &in, buf, n);
+	} else if (a->family == AF_INET6) {
+		inet_ntop(AF_INET6, a->v6, buf, n);
+	} else {
+		snprintf(buf, n, "(?)");
+	}
+	return buf;
+}
+
+/* "1.2.3.4:1702" / "[fd00::1]:1702" */
+static const char *addr_port_str(const struct xaddr *a, uint16_t port_be,
+				 char *buf, size_t n)
+{
+	char ab[64];
+
+	addr_str(a, ab, sizeof(ab));
+	if (a->family == AF_INET6)
+		snprintf(buf, n, "[%s]:%hu", ab, ntohs(port_be));
+	else
+		snprintf(buf, n, "%s:%hu", ab, ntohs(port_be));
+	return buf;
+}
+
+/* address-style mask for a prefix length (the only place prefix math
+ * exists; everything downstream sees a plain mask) */
+static void plen_to_mask(int family, int plen, struct xaddr *mask)
+{
+	int i;
+
+	memset(mask, 0, sizeof(*mask));
+	mask->family = family;
+	if (family == AF_INET) {
+		mask->v4 = plen ? htonl((uint32_t)~0U << (32 - plen)) : 0;
+		return;
+	}
+	for (i = 0; i < plen; i++)
+		mask->v6[i / 8] |= (uint8_t)(0x80 >> (i % 8));
+}
+
+/* parse one --filter-ip / --filter-ip6 entry, "a" or "a/m":
+ *   m all-digits within family range -> prefix length (10.0.0.0/24)
+ *   otherwise                        -> address-style mask
+ *                                    (10.0.0.0/255.255.255.0,
+ *                                     fd00::/ffff:ffff::)
+ * a bare address is an exact match.  The entry is normalized here
+ * (addr &= mask) and sent as raw {addr, mask}; no network/host semantics
+ * travel further than this function. */
+static int parse_filter(const char *s, int family,
+			struct xaddr *addr, struct xaddr *mask)
+{
+	char buf[256], *sl;
+	int maxbits = family == AF_INET6 ? 128 : 32;
+	int i;
+
+	snprintf(buf, sizeof(buf), "%s", s);
+	sl = strchr(buf, '/');
+	if (sl)
+		*sl++ = '\0';
+
+	memset(addr, 0, sizeof(*addr));
+	memset(mask, 0, sizeof(*mask));
+	addr->family = mask->family = family;
+	if (inet_pton(family, buf, family == AF_INET6 ? (void *)addr->v6
+						      : &addr->v4) != 1)
+		return -1;
+
+	if (!sl) {
+		plen_to_mask(family, maxbits, mask);	/* exact match */
+	} else {
+		char *end = NULL;
+		long v = strtol(sl, &end, 10);
+
+		if (end && !*end && v >= 0 && v <= maxbits)
+			plen_to_mask(family, (int)v, mask);
+		else if (inet_pton(family, sl,
+				   family == AF_INET6 ? (void *)mask->v6
+						      : &mask->v4) != 1)
 			return -1;
 	}
-	memset(out, 0, sizeof(*out));
-	out->sin_family = AF_INET;
-	out->sin_port = htons((uint16_t)port);
-	if (inet_pton(AF_INET, buf, &out->sin_addr) != 1)
-		return -1;
+
+	if (family == AF_INET) {
+		addr->v4 &= mask->v4;
+	} else {
+		for (i = 0; i < 16; i++)
+			addr->v6[i] &= mask->v6[i];
+	}
 	return 0;
 }
 
@@ -443,13 +584,6 @@ static uint64_t attr_u64(struct nlattr *na)
 	return v;
 }
 
-static const char *ip_ntoa(uint32_t be)
-{
-	struct in_addr a = { .s_addr = be };
-
-	return inet_ntoa(a);
-}
-
 /* ---------------- offload-state persistence ---------------- */
 
 /* the userspace a2tp-srv kept this in process memory; a ctl tool lives
@@ -505,15 +639,53 @@ static int offl_load_apply(const char *ifname)
 
 /* ---------------- server (genl) commands ---------------- */
 
+/* one parsed {addr, mask} entry onto the wire */
+static void put_filter_entry(struct nlbuf *nb, const struct xaddr *addr,
+			     const struct xaddr *mask)
+{
+	size_t nest = nl_nest_start(nb, 1 /* position-only type */);
+	int v6 = addr->family == AF_INET6;
+	size_t len = v6 ? 16 : 4;
+
+	nl_put_attr(nb, A2TP_FILTER_ADDR, v6 ? (const void *)addr->v6 : &addr->v4,
+		    len);
+	nl_put_attr(nb, A2TP_FILTER_MASK, v6 ? (const void *)mask->v6 : &mask->v4,
+		    len);
+	nl_nest_end(nb, nest);
+}
+
+/* parse a comma-separated --filter-ip[-6] argument into fa/fm */
+static void parse_filter_list(const char *s, int family,
+			      struct xaddr fa[], struct xaddr fm[],
+			      int *n, int *n_other)
+{
+	char *dup = strdup(s), *tok, *save = NULL;
+
+	for (tok = strtok_r(dup, ",", &save); tok;
+	     tok = strtok_r(NULL, ",", &save)) {
+		if (*n + *n_other >= A2TP_FILTER_MAX)
+			die("too many filter entries (max %d)", A2TP_FILTER_MAX);
+		if (parse_filter(tok, family, &fa[*n], &fm[*n]) < 0)
+			die("bad filter entry \"%s\" (family %s)", tok,
+			    family == AF_INET6 ? "ipv6" : "ipv4");
+		(*n)++;
+	}
+	free(dup);
+}
+
 static int cmd_srv_add(int argc, char **argv)
 {
 	const char *ifname = NULL, *bind_s = NULL, *peer_s = NULL;
-	const char *filter_s[A2TP_FILTER_IP_MAX];
-	int nfilter = 0, i;
+	const char *filter4_s = NULL, *filter6_s = NULL;
+	int i;
 	uint16_t port = A2TP_UDP_PORT;
 	uint32_t peer_timeout_s = 30;
 	bool no_self_filter = false, keep_offloads = false;
-	struct sockaddr_in peer = {}, bind_addr = {};
+	struct xaddr peer_a = {}, bind_a = {};
+	uint16_t peer_port = 0;
+	struct xaddr f4a[A2TP_FILTER_MAX], f4m[A2TP_FILTER_MAX];
+	struct xaddr f6a[A2TP_FILTER_MAX], f6m[A2TP_FILTER_MAX];
+	int nf4 = 0, nf6 = 0;
 	struct nlsk sk;
 	struct nlbuf nb = { .len = 0 };
 	size_t nest;
@@ -532,11 +704,10 @@ static int cmd_srv_add(int argc, char **argv)
 			peer_timeout_s = (uint32_t)strtoul(argv[++i], NULL, 0);
 		else if (!strcmp(argv[i], "-b") && i + 1 < argc)
 			bind_s = argv[++i];
-		else if (!strcmp(argv[i], "--filter-ip") && i + 1 < argc) {
-			if (nfilter >= A2TP_FILTER_IP_MAX)
-				die("too many --filter-ip entries");
-			filter_s[nfilter++] = argv[++i];
-		}
+		else if (!strcmp(argv[i], "--filter-ip") && i + 1 < argc)
+			filter4_s = argv[++i];
+		else if (!strcmp(argv[i], "--filter-ip6") && i + 1 < argc)
+			filter6_s = argv[++i];
 		else if (!strcmp(argv[i], "--no-self-filter"))
 			no_self_filter = true;
 		else if (!strcmp(argv[i], "--keep-offloads"))
@@ -547,9 +718,11 @@ static int cmd_srv_add(int argc, char **argv)
 	if (!ifname)
 		die("srv add: -i <iface> required");
 
-	if (peer_s && parse_ip_port(peer_s, A2TP_UDP_PORT, &peer) < 0)
-		die("bad --peer \"%s\"", peer_s);
-	if (bind_s && !inet_aton(bind_s, &bind_addr.sin_addr))
+	if (peer_s && parse_addr_port(peer_s, A2TP_UDP_PORT, &peer_a,
+				      &peer_port) < 0)
+		die("bad --peer \"%s\" (v6 needs brackets: [fd00::1]:1702)",
+		    peer_s);
+	if (bind_s && parse_addr(bind_s, &bind_a) < 0)
 		die("bad -b \"%s\"", bind_s);
 
 	/* offloads off BEFORE the kernel pump starts mirroring, exactly like
@@ -572,33 +745,37 @@ static int cmd_srv_add(int argc, char **argv)
 	genl_start(&nb, genl_resolve(&sk, A2TP_GENL_NAME), A2TP_CMD_SRV_ADD, 0);
 	nl_put_str(&nb, A2TP_ATTR_IFNAME, ifname);
 	nl_put_u16(&nb, A2TP_ATTR_PORT, port);
-	if (bind_s)
-		nl_put_u32(&nb, A2TP_ATTR_BIND_IP, bind_addr.sin_addr.s_addr);
+	if (bind_s) {
+		if (bind_a.family == AF_INET6)
+			nl_put_attr(&nb, A2TP_ATTR_BIND_IP6, bind_a.v6, 16);
+		else
+			nl_put_u32(&nb, A2TP_ATTR_BIND_IP, bind_a.v4);
+	}
 	if (peer_s) {
 		nl_put_flag(&nb, A2TP_ATTR_PEER_FIXED);
-		nl_put_u32(&nb, A2TP_ATTR_PEER_IP, peer.sin_addr.s_addr);
-		nl_put_attr(&nb, A2TP_ATTR_PEER_PORT, &peer.sin_port, 2);
+		if (peer_a.family == AF_INET6)
+			nl_put_attr(&nb, A2TP_ATTR_PEER_IP6, peer_a.v6, 16);
+		else
+			nl_put_u32(&nb, A2TP_ATTR_PEER_IP, peer_a.v4);
+		nl_put_attr(&nb, A2TP_ATTR_PEER_PORT, &peer_port, 2);
 	}
 	nl_put_u32(&nb, A2TP_ATTR_PEER_TIMEOUT, peer_timeout_s * 1000);
 	if (no_self_filter)
 		nl_put_flag(&nb, A2TP_ATTR_NO_SELF_FILTER);
-	if (nfilter) {
+	if (filter4_s)
+		parse_filter_list(filter4_s, AF_INET, f4a, f4m, &nf4, &nf6);
+	if (filter6_s)
+		parse_filter_list(filter6_s, AF_INET6, f6a, f6m, &nf6, &nf4);
+	if (nf4) {
 		nest = nl_nest_start(&nb, A2TP_ATTR_FILTER_IP);
-		for (i = 0; i < nfilter; i++) {
-			char *dup = strdup(filter_s[i]);
-			char *tok = strtok(dup, ",");
-
-			while (tok) {
-				struct in_addr a;
-
-				if (!inet_aton(tok, &a))
-					die("bad filter ip \"%s\"", tok);
-				nl_put_u32(&nb, 1 /* position-only type */,
-					   a.s_addr);
-				tok = strtok(NULL, ",");
-			}
-			free(dup);
-		}
+		for (i = 0; i < nf4; i++)
+			put_filter_entry(&nb, &f4a[i], &f4m[i]);
+		nl_nest_end(&nb, nest);
+	}
+	if (nf6) {
+		nest = nl_nest_start(&nb, A2TP_ATTR_FILTER_IP6);
+		for (i = 0; i < nf6; i++)
+			put_filter_entry(&nb, &f6a[i], &f6m[i]);
 		nl_nest_end(&nb, nest);
 	}
 
@@ -609,9 +786,22 @@ static int cmd_srv_add(int argc, char **argv)
 			offl_load_apply(ifname);
 		return 1;
 	}
-	logmsg("srv %s up: port %u%s%s%s", ifname, port,
-	       bind_s ? " bind " : "", bind_s ? bind_s : "",
-	       keep_offloads ? " (offloads untouched)" : "");
+	{
+		char bs[80] = "";
+
+		if (bind_s) {
+			addr_str(&bind_a, bs, sizeof(bs));
+			if (bind_a.family == AF_INET6) {
+				char b6[80];
+
+				snprintf(b6, sizeof(b6), "[%s]", bs);
+				snprintf(bs, sizeof(bs), "%s", b6);
+			}
+		}
+		logmsg("srv %s up: port %u%s%s%s", ifname, port,
+		       bind_s ? " carrier " : "", bs,
+		       keep_offloads ? " (offloads untouched)" : "");
+	}
 	return 0;
 }
 
@@ -648,17 +838,18 @@ static int cmd_srv_del(int argc, char **argv)
 /* pretty-print one SRV_GET instance message */
 static void srv_status_one(struct nlmsghdr *nh)
 {
+	struct xaddr fa[A2TP_FILTER_MAX], fm[A2TP_FILTER_MAX];
+	int nf = 0, i, fam;
 	struct walk w;
 	const char *ifname = "(?)";
-	char bind[64] = "0.0.0.0";
-	uint16_t port = 0;
-	uint32_t peer_ip = 0;
-	uint16_t peer_port = 0;
+	struct xaddr bind = {}, peer = {};
+	char b1[80], b2[80], b3[80];
+	uint16_t port = 0, peer_port = 0;
 	uint32_t peer_timeout = 0;
 	bool fixed = false, known = false;
 	uint64_t age = 0;
 	uint64_t stats[A2TP_KSTAT_NR] = {};
-	bool has_stats = false, has_filter = false;
+	bool has_stats = false;
 
 	attr_first(&w, nh, GENL_HDRLEN);
 	for (; attr_ok(&w); attr_advance(&w)) {
@@ -670,10 +861,20 @@ static void srv_status_one(struct nlmsghdr *nh)
 			port = attr_u16(w.na);
 			break;
 		case A2TP_ATTR_BIND_IP:
-			snprintf(bind, sizeof(bind), "%s", ip_ntoa(attr_u32(w.na)));
+			bind.family = AF_INET;
+			bind.v4 = attr_u32(w.na);
+			break;
+		case A2TP_ATTR_BIND_IP6:
+			bind.family = AF_INET6;
+			memcpy(bind.v6, (char *)w.na + NLA_HDRLEN, 16);
 			break;
 		case A2TP_ATTR_PEER_IP:
-			peer_ip = attr_u32(w.na);
+			peer.family = AF_INET;
+			peer.v4 = attr_u32(w.na);
+			break;
+		case A2TP_ATTR_PEER_IP6:
+			peer.family = AF_INET6;
+			memcpy(peer.v6, (char *)w.na + NLA_HDRLEN, 16);
 			break;
 		case A2TP_ATTR_PEER_PORT:
 			peer_port = attr_u16(w.na);
@@ -690,27 +891,40 @@ static void srv_status_one(struct nlmsghdr *nh)
 		case A2TP_ATTR_PEER_AGE_MS:
 			age = attr_u64(w.na);
 			break;
-		case A2TP_ATTR_FILTER_IP: {
-			struct walk fw;
+		case A2TP_ATTR_FILTER_IP:
+		case A2TP_ATTR_FILTER_IP6: {
+			struct walk fw, ew;
+			int t, len;
 
-			has_filter = true;
-			printf("srv %s: local %s:%u", ifname, bind, port);
-			if (fixed)
-				printf("  peer fixed %s:%u", ip_ntoa(peer_ip),
-				       peer_port);
-			else if (known)
-				printf("  peer learned %s:%u (age %llums)",
-				       ip_ntoa(peer_ip), peer_port,
-				       (unsigned long long)age);
-			else
-				printf("  peer unknown");
-			if (peer_timeout)
-				printf("  timeout %ums", peer_timeout);
-			printf("\n    filter-ip:");
+			fam = (w.na->nla_type & NLA_TYPE_MASK) ==
+			      A2TP_ATTR_FILTER_IP ? AF_INET : AF_INET6;
+			len = fam == AF_INET ? 4 : 16;
 			nest_walk(&fw, w.na);
-			for (; attr_ok(&fw); attr_advance(&fw))
-				printf(" %s", ip_ntoa(attr_u32(fw.na)));
-			printf("\n");
+			for (; attr_ok(&fw) && nf < A2TP_FILTER_MAX;
+			     attr_advance(&fw)) {
+				memset(&fa[nf], 0, sizeof(fa[nf]));
+				memset(&fm[nf], 0, sizeof(fm[nf]));
+				fa[nf].family = fm[nf].family = fam;
+				nest_walk(&ew, fw.na);
+				for (; attr_ok(&ew); attr_advance(&ew)) {
+					t = ew.na->nla_type & NLA_TYPE_MASK;
+					if (t == A2TP_FILTER_ADDR &&
+					    ew.na->nla_len >= NLA_HDRLEN + len)
+						memcpy(fam == AF_INET ?
+						       (void *)&fa[nf].v4 :
+						       fa[nf].v6,
+						       (char *)ew.na + NLA_HDRLEN,
+						       len);
+					else if (t == A2TP_FILTER_MASK &&
+						 ew.na->nla_len >= NLA_HDRLEN + len)
+						memcpy(fam == AF_INET ?
+						       (void *)&fm[nf].v4 :
+						       fm[nf].v6,
+						       (char *)ew.na + NLA_HDRLEN,
+						       len);
+				}
+				nf++;
+			}
 			break;
 		}
 		case A2TP_ATTR_STATS: {
@@ -726,21 +940,46 @@ static void srv_status_one(struct nlmsghdr *nh)
 		}
 	}
 
-	if (!has_filter) {
-		printf("srv %s: local %s:%u", ifname, bind, port);
-		if (fixed)
-			printf("  peer fixed %s:%u", ip_ntoa(peer_ip), peer_port);
-		else if (known)
-			printf("  peer learned %s:%u (age %llums)",
-			       ip_ntoa(peer_ip), peer_port,
-			       (unsigned long long)age);
-		else
-			printf("  peer unknown");
-		printf("\n");
-	}
-	if (has_stats) {
-		int i;
+	if (bind.family == AF_UNSPEC)
+		snprintf(b1, sizeof(b1), "*");
+	else if (bind.family == AF_INET6)
+		snprintf(b1, sizeof(b1), "[%s]", addr_str(&bind, b3, sizeof(b3)));
+	else
+		addr_str(&bind, b1, sizeof(b1));
 
+	printf("srv %s: local %s:%u", ifname, b1, port);
+	if (fixed)
+		printf("  peer fixed %s", addr_port_str(&peer, peer_port,
+							b2, sizeof(b2)));
+	else if (known)
+		printf("  peer learned %s (age %llums)",
+		       addr_port_str(&peer, peer_port, b2, sizeof(b2)),
+		       (unsigned long long)age);
+	else
+		printf("  peer unknown");
+	if (peer_timeout)
+		printf("  timeout %ums", peer_timeout);
+	printf("\n");
+
+	/* one line per family, only when that family has entries */
+	for (fam = AF_INET; fam <= AF_INET6; fam++) {
+		bool head = false;
+
+		for (i = 0; i < nf; i++) {
+			if (fa[i].family != fam)
+				continue;
+			if (!head) {
+				printf("    filter-ip%s:", fam == AF_INET6 ? "6" : "");
+				head = true;
+			}
+			printf(" %s/%s", addr_str(&fa[i], b1, sizeof(b1)),
+				addr_str(&fm[i], b2, sizeof(b2)));
+		}
+		if (head)
+			printf("\n");
+	}
+
+	if (has_stats) {
 		printf("    ");
 		for (i = 0; i < A2TP_KSTAT_NR; i++)
 			printf("%s=%llu ", a2tp_kstat_name[i],
@@ -802,11 +1041,13 @@ static int cmd_srv_status(int argc, char **argv)
 
 static int cmd_cli_add(int argc, char **argv)
 {
-	const char *ifname = NULL, *remote_s = NULL, *mac_s = NULL;
+	const char *ifname = NULL, *remote_s = NULL, *local_s = NULL;
+	const char *mac_s = NULL;
 	uint16_t local_port = 0;
 	uint32_t keepalive_ms = 10000, mtu = 0;
 	uint8_t mac[6];
-	struct sockaddr_in remote;
+	struct xaddr remote = {}, local = {};
+	uint16_t remote_port = 0;
 	struct nlsk sk;
 	struct nlbuf nb = { .len = 0 };
 	size_t info, data;
@@ -815,6 +1056,7 @@ static int cmd_cli_add(int argc, char **argv)
 		struct ifinfomsg	ifi;
 	} hdr = { 0 };
 	int i, rc;
+	char rs[80];
 
 	if (argc < 1)
 		die("cli add <name> remote <ip[:port]> [key value..]");
@@ -822,6 +1064,8 @@ static int cmd_cli_add(int argc, char **argv)
 	for (i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "remote") && i + 1 < argc)
 			remote_s = argv[++i];
+		else if (!strcmp(argv[i], "local") && i + 1 < argc)
+			local_s = argv[++i];
 		else if (!strcmp(argv[i], "local-port") && i + 1 < argc)
 			local_port = (uint16_t)strtoul(argv[++i], NULL, 0);
 		else if (!strcmp(argv[i], "keepalive-ms") && i + 1 < argc)
@@ -835,8 +1079,15 @@ static int cmd_cli_add(int argc, char **argv)
 	}
 	if (!remote_s)
 		die("cli add: remote <ip[:port]> required");
-	if (parse_ip_port(remote_s, A2TP_UDP_PORT, &remote) < 0)
-		die("bad remote \"%s\"", remote_s);
+	if (parse_addr_port(remote_s, A2TP_UDP_PORT, &remote, &remote_port) < 0)
+		die("bad remote \"%s\" (v6 needs brackets: [fd00::1]:1702)",
+		    remote_s);
+	if (local_s) {
+		if (parse_addr(local_s, &local) < 0)
+			die("bad local \"%s\"", local_s);
+		if (local.family != remote.family)
+			die("local \"%s\" family must match the remote", local_s);
+	}
 	if (mac_s && parse_mac(mac_s, mac) < 0)
 		die("bad mac \"%s\"", mac_s);
 
@@ -853,8 +1104,16 @@ static int cmd_cli_add(int argc, char **argv)
 	info = nl_nest_start(&nb, IFLA_LINKINFO);
 	nl_put_str(&nb, IFLA_INFO_KIND, A2TP_LINK_KIND);
 	data = nl_nest_start(&nb, IFLA_INFO_DATA);
-	nl_put_attr(&nb, IFLA_A2TP_REMOTE_IP, &remote.sin_addr.s_addr, 4);
-	nl_put_attr(&nb, IFLA_A2TP_REMOTE_PORT, &remote.sin_port, 2);
+	if (remote.family == AF_INET6) {
+		nl_put_attr(&nb, IFLA_A2TP_REMOTE_IP6, remote.v6, 16);
+		if (local_s)
+			nl_put_attr(&nb, IFLA_A2TP_LOCAL_IP6, local.v6, 16);
+	} else {
+		nl_put_attr(&nb, IFLA_A2TP_REMOTE_IP, &remote.v4, 4);
+		if (local_s)
+			nl_put_attr(&nb, IFLA_A2TP_LOCAL_IP, &local.v4, 4);
+	}
+	nl_put_attr(&nb, IFLA_A2TP_REMOTE_PORT, &remote_port, 2);
 	nl_put_u16(&nb, IFLA_A2TP_LOCAL_PORT, local_port);
 	nl_put_u32(&nb, IFLA_A2TP_KEEPALIVE_MS, keepalive_ms);
 	nl_nest_end(&nb, data);
@@ -866,9 +1125,10 @@ static int cmd_cli_add(int argc, char **argv)
 		logmsg("cli add failed: %s", strerror(-rc));
 		return 1;
 	}
-	logmsg("cli %s created: remote %s:%hu, local port %s -- "
+	logmsg("cli %s created: remote %s, carrier %s, local port %s -- "
 	       "configure and bring it up with ip(8)",
-	       ifname, ip_ntoa(remote.sin_addr.s_addr), ntohs(remote.sin_port),
+	       ifname, addr_port_str(&remote, remote_port, rs, sizeof(rs)),
+	       local_s ? addr_str(&local, rs, sizeof(rs)) : "(routing table)",
 	       local_port ? "(fixed)" : "ephemeral");
 	return 0;
 }
@@ -914,14 +1174,23 @@ static void usage(void)
 	fprintf(stderr,
 "usage: a2tpctl <command> [args]          (needs the a2tp kernel module)\n"
 "\n"
-"  srv add -i <iface> [-p <port>] [-b <bind ip>] [--peer <ip:port>]\n"
-"          [--peer-timeout <sec>] [--filter-ip <ip[,ip..]>]...\n"
+"  srv add -i <iface> [-p <port>] [-b <carrier ip>]\n"
+"          [--peer <ip:port>] [--peer-timeout <sec>]\n"
+"          [--filter-ip <a[/m][,a[/m]..]>] [--filter-ip6 <a[/m]..>]\n"
 "          [--no-self-filter] [--keep-offloads]\n"
+"        filter m: prefix len (10.0.0.0/24, fd00::/64) or address-style\n"
+"        mask (10.0.0.0/255.255.255.0, fd00::/ffff:ffff::); bare = exact;\n"
+"        pure mask match, families independent\n"
 "  srv del -i <iface>\n"
 "  srv status\n"
-"  cli add <name> remote <ip[:port]> [local-port <n>] [keepalive-ms <n>]\n"
-"          [mtu <n>] [mac <aa:bb:cc:dd:ee:ff>]\n"
-"  cli del <name>\n");
+"  cli add <name> remote <ip[:port]> [local <carrier ip>]\n"
+"          [local-port <n>] [keepalive-ms <n>] [mtu <n>]\n"
+"          [mac <aa:bb:cc:dd:ee:ff>]\n"
+"  cli del <name>\n"
+"\n"
+"v6 endpoints with a port need brackets: [fd00::1]:1702\n"
+"without -b/local the outer source follows the routing table; the tunnel\n"
+"survives carrier/route outages and resumes on its own\n");
 	exit(2);
 }
 

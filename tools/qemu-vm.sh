@@ -104,7 +104,7 @@ EOF
     fi
     say "bake: ssh up; installing toolchain + headers (slow via SLIRP)..."
     if ! SSH_CMD_TIMEOUT="${BAKE_TIMEOUT:-1800}" ssh_vm \
-        'sudo sh -c "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tcpdump ethtool build-essential linux-headers-generic"'; then
+        'sudo sh -c "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tcpdump ethtool build-essential linux-headers-generic wireguard-tools"'; then
         say "bake: package install failed"; ssh_vm 'sudo poweroff' 2>/dev/null; return 1
     fi
     ssh_vm 'sudo mkdir -p /mnt/a2tp && echo "a2tp /mnt/a2tp 9p trans=virtio,version=9p2000.L,msize=104857600 0 0" | sudo tee -a /etc/fstab >/dev/null && grep a2tp /etc/fstab'

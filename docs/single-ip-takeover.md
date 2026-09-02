@@ -4,6 +4,19 @@
 `a2tp-srv` 只把它对应的流量镜像过隧道，其余 IP 的流量完全不受影响。本机与远端
 **同时在线、各用各的 IP**。
 
+> [!NOTE]
+> 本文命令以用户态版（`a2tp-srv`/`a2tp-cli`）为例。内核模块版（推荐，见
+> [kernel.md](kernel.md)）原理与语义**完全相同**，命令对照：
+>
+> | 用户态 | 内核版 |
+> |---|---|
+> | `sudo ./a2tp-srv -i eth0 --filter-ip 192.168.1.123` | `sudo ./a2tpctl srv add -i eth0 --filter-ip 192.168.1.123` |
+> | （退出进程即停） | `sudo ./a2tpctl srv del -i eth0` |
+> | `sudo ./a2tp-cli -s <ip> --tap a2tp0` | `sudo ./a2tpctl cli add a2tp0 remote <ip>` / `cli del a2tp0` |
+>
+> 掩码写法内核版更强：`--filter-ip`/`--filter-ip6` 支持前缀长度与地址式掩码
+> （`10.0.0.0/24`、`255.255.255.0`、`fd00::/64`），且 v4/v6 两族独立过滤。
+
 ```
                 server 主机 (网卡多 IP)                        client 主机
         ┌───────────────────────────────────┐          ┌──────────────────────┐
@@ -18,8 +31,8 @@ LAN ────┤ eth0 / wlp8s0                     │          │  tap a2tp
 ```
 
 本文以 `192.168.1.101`（保留）/ `192.168.1.123`（搬走）/ 网关 `192.168.1.1` 为例。
-全程有自动化测试背书：`testbed.sh` 的 T6（veth 实验室）与 `wifi-multiip.sh`
-（真实 WiFi，5 项断言）。
+全程有自动化测试背书：`test/qemu.sh testbed` 的 T6/T8（veth 实验室，v4/v6 掩码
+过滤，QEMU 沙箱）。
 
 ---
 
@@ -138,7 +151,7 @@ mirror filter: ipv4 dst in {192.168.1.123} (arp passes, rest stays local)
 
 | 症状 | 原因 → 处置 |
 |---|---|
-| client ping 网关不通，tap 上看不到 ARP request | underlay 断了：查 server `peer:` 日志、防火墙放行 UDP 1702（firewalld 默认 zone 丢入站 UDP，见 `wifi.sh` 的 trusted-zone 处理） |
+| client ping 网关不通，tap 上看不到 ARP request | underlay 断了：查 server `peer:` 日志、防火墙放行 UDP 1702（firewalld 默认 zone 丢入站 UDP，需放行或改 trusted zone） |
 | ARP 有来有回但 ping 不通 | IP 没从 host 删除 → host 内核把 request/echo 也消费了；`ip addr` 确认 |
 | WiFi 上完全不通 | tap 没克隆网卡 MAC → AP 不交付/丢弃注入帧；`--mac $(cat /sys/class/net/wlp8s0/address)` |
 | 通一下就断/时好时坏 | 同 netns 部署缺 `arp_ignore=1`（ARP flux 污染对端邻居表，见 README） |
@@ -163,9 +176,5 @@ sudo ip addr add 192.168.1.123/24 dev wlp8s0
 sudo arping -U -I wlp8s0 -c 3 192.168.1.123
 ```
 
-`test/wifi-multiip.sh` 把上述整套（删除→接管→验证→还原）做成了 5 项断言的自动
-化测试，可直接当参考实现或回归用：
-
-```bash
-sudo bash test/wifi-multiip.sh [iface] [ip]     # 默认 wlp8s0 192.168.1.123
-```
+上述整套（删除→接管→验证→还原）有 QEMU 沙箱自动化回归背书：`test/qemu.sh
+testbed` 的 T6（`--filter-ip` 多 IP 过滤）与 T8（`--filter-ip6` 掩码过滤）。

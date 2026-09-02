@@ -17,13 +17,24 @@
 # Every frame l2t-l0 sends must appear on the tap (mirror direction) and
 # every frame the tap emits must come out of l2t-l0 (inject direction).
 #
+# T7/T8 add IPv6: the outer UDP rides fd00:9::/64 and the inner payload is
+# v6 too (NDP + ICMPv6 through the mirror).  T9 proves the tunnel survives
+# a vanished carrier: no traffic while it is gone, instant resume after.
+# T10 moves the client into its own netns with two underlay uplinks ("wifi"
+# and "cable"), then cuts wifi: the default route falls over to the cable,
+# the unpinned client silently changes source address and the *same* server
+# instance re-learns the peer -- nothing is reconfigured anywhere.
+#
 set -u
 cd "$(dirname "$0")/.."
 
-NS_SRV=l2t-srv; NS_LAN=l2t-lan
+NS_SRV=l2t-srv; NS_LAN=l2t-lan; NS_CLI=l2t-cli
 V_SRV=l2t-s0;  V_LAN=l2t-l0
 TAP=l2t-tap
 SRV_IP=10.9.0.1; LAN_IP=10.9.0.2; TAP_IP=10.9.0.20
+SRV_IP6=fd00:9::1; LAN_IP6=fd00:9::2; TAP_IN6=fd00:99::2; LAN_IN6=fd00:99::1
+# T10 dual underlay: the client reaches the same server through either ISP
+WIFI_NET=192.0.2;     CABLE_NET=198.51.100   # .1 = server, .10 = client
 SRV_PORT=1702   # keep in sync with A2TP_UDP_PORT
 FAKE_MAC=02:11:22:33:44:55; FAKE_IP=10.9.0.99
 SRV_LOG=/tmp/a2tp-srv.log; CLI_LOG=/tmp/a2tp-cli.log
@@ -42,21 +53,21 @@ srv_up() {  # extra args: a2tpctl srv add flags (-b, --filter-ip, ...)
 srv_down() {
     ip netns exec "$NS_SRV" ./a2tpctl srv del -i "$V_SRV" >>"$SRV_LOG" 2>&1
 }
-cli_up() {  # optional arg: remote address (default $SRV_IP)
-    local remote=${1:-$SRV_IP}
+cli_up() {  # optional: remote address, tap address (defaults: v4 set)
+    local remote=${1:-$SRV_IP} addr=${2:-$TAP_IP/24}
     ip netns exec "$NS_SRV" ./a2tpctl cli add "$TAP" remote "$remote" \
         local-port 0 >>"$CLI_LOG" 2>&1
     ip -n "$NS_SRV" link set "$TAP" up
     sleep 1
     # addressing is the config script's job, not the client's
-    ip -n "$NS_SRV" addr replace "$TAP_IP/24" dev "$TAP"
+    ip -n "$NS_SRV" addr replace $addr dev "$TAP"
 }
 cli_down() {
     ip -n "$NS_SRV" link del "$TAP" 2>/dev/null
 }
-# learned peer "ip:port" from the kernel server instance
+# learned peer "ip:port" / "[v6]:port" from the kernel server instance
 peer() { ip netns exec "$NS_SRV" ./a2tpctl srv status \
-    | sed -n "s/^srv $V_SRV:.*peer learned \([0-9.]*:[0-9]*\).*/\1/p"; }
+    | sed -n "s/^srv $V_SRV:.*peer learned \(\[[0-9a-f:]*\]:[0-9]*\|[0-9.]*:[0-9]*\).*/\1/p"; }
 
 cleanup() {
     srv_down 2>/dev/null
@@ -64,6 +75,7 @@ cleanup() {
     sleep 0.3
     ip netns del "$NS_SRV" 2>/dev/null
     ip netns del "$NS_LAN" 2>/dev/null
+    ip netns del "$NS_CLI" 2>/dev/null
     ip link del "$TAP" 2>/dev/null
 }
 trap cleanup EXIT
@@ -184,7 +196,10 @@ fi
 srv_down; cli_down
 sleep 0.5
 FIP=10.9.0.3   # "second IP of the NIC", owned only by the client's tap
-srv_up --filter-ip "$FIP"
+# mask forms all in one list: /31 covers .2+.3 (not the server's .1), the
+# /32 exact entry is redundant but exercises the prefix-length spelling
+FMASK=255.255.255.254
+srv_up --filter-ip "10.9.0.2/$FMASK,10.9.0.3/32"
 sleep 0.7
 cli_up
 ip -n "$NS_SRV" addr replace "$FIP/24" dev "$TAP"
@@ -213,6 +228,147 @@ else
     bad "T6 --filter-ip: lan->filtered=$A lan->other=$B other-on-tap=$C tap->lan=$D"
     tail -n 5 "$SRV_LOG" "$CLI_LOG"
 fi
+
+# ---------- T7: v6 outer transport + v6 inner payload ----------
+srv_down; cli_down
+sleep 0.5
+ip -n "$NS_SRV" addr add "$SRV_IP6/64" dev "$V_SRV" nodad
+ip -n "$NS_LAN" addr add "$LAN_IP6/64" dev "$V_LAN" nodad
+ip -n "$NS_LAN" addr add "$LAN_IN6/64" dev "$V_LAN" nodad
+srv_up
+sleep 0.6
+cli_up "$SRV_IP6" "$TAP_IN6/64 nodad"
+if ip netns exec "$NS_SRV" ping -6 -I "$TAP" -c 3 -W 2 "$LAN_IN6" >/dev/null 2>&1; then
+    P=ok
+else
+    P=fail
+fi
+PEER6=$(ip netns exec "$NS_SRV" ./a2tpctl srv status \
+    | grep -o "peer learned \[$SRV_IP6\]:[0-9]*" | head -1)
+if [ "$P" = ok ] && [ -n "$PEER6" ]; then
+    ok "T7 v6 transport: outer UDP over v6, inner NDP+ICMPv6 tunneled ($PEER6)"
+else
+    bad "T7 v6 transport: ping=$P peer6='$PEER6'"
+    tail -n 5 "$SRV_LOG" "$CLI_LOG"
+fi
+
+# ---------- T8: --filter-ip6 with an address-style hex mask ----------
+srv_down; cli_down
+sleep 0.5
+FIP6=fd00:9::3   # "second v6 of the NIC", owned only by the client's tap
+FMASK6=ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe   # /127: fd00:9::2 and ::3
+srv_up --filter-ip6 "$LAN_IP6/$FMASK6"
+sleep 0.7
+cli_up "$SRV_IP6" "$FIP6/64 nodad"
+
+# a) filtered v6 is tunneled (NDP always passes, that is how the tap
+#    becomes resolvable at all)
+ip netns exec "$NS_LAN" ping -6 -c 3 -W 2 "$FIP6" >/dev/null 2>&1 \
+    && A=ok || A=fail
+# b) the NIC's own v6: local stack answers it, and none of that traffic
+#    may appear on the tap
+ip netns exec "$NS_SRV" timeout 6 tcpdump -ni "$TAP" -c 4 \
+    "icmp6 and dst host $SRV_IP6" >/tmp/t8v6.cap 2>&1 &
+TD=$!
+sleep 0.3
+ip netns exec "$NS_LAN" ping -6 -c 3 -W 2 "$SRV_IP6" >/dev/null 2>&1 \
+    && B=ok || B=fail
+wait $TD 2>/dev/null
+grep -q '0 packets captured' /tmp/t8v6.cap && C=ok || C=fail
+# c) tap -> LAN still works with the filter on (both ways inside the mask)
+ip netns exec "$NS_SRV" ping -6 -I "$TAP" -c 3 -W 2 "$LAN_IP6" >/dev/null 2>&1 \
+    && D=ok || D=fail
+
+if [ "$A" = ok ] && [ "$B" = ok ] && [ "$C" = ok ] && [ "$D" = ok ]; then
+    ok "T8 --filter-ip6 $LAN_IP6/$FMASK6: $FIP6 tunneled, $SRV_IP6 stayed local"
+else
+    bad "T8 --filter-ip6: lan->filtered=$A lan->other=$B other-on-tap=$C tap->lan=$D"
+    tail -n 5 "$SRV_LOG" "$CLI_LOG"
+fi
+
+# ---------- T9: carrier outage -- tunnel survives, waits, resumes ----------
+srv_down; cli_down
+sleep 0.5
+srv_up -b "$SRV_IP"
+sleep 0.7
+cli_up
+ip netns exec "$NS_SRV" ping -I "$TAP" -c 2 -W 2 "$LAN_IP" >/dev/null 2>&1 \
+    && PRE=ok || PRE=fail
+ip -n "$NS_SRV" addr del "$SRV_IP/24" dev "$V_SRV"	# carrier ip gone
+sleep 0.5
+ip netns exec "$NS_SRV" ping -I "$TAP" -c 2 -W 1 "$LAN_IP" >/dev/null 2>&1 \
+    && DOWN=unexpected || DOWN=ok
+ip netns exec "$NS_SRV" ./a2tpctl srv status | grep -q "^srv $V_SRV:" \
+    && ALIVE=ok || ALIVE=fail
+ip -n "$NS_SRV" addr add "$SRV_IP/24" dev "$V_SRV"	# carrier back
+sleep 1
+ip netns exec "$NS_SRV" ping -I "$TAP" -c 3 -W 2 "$LAN_IP" >/dev/null 2>&1 \
+    && POST=ok || POST=fail
+
+if [ "$PRE" = ok ] && [ "$DOWN" = ok ] && [ "$ALIVE" = ok ] && [ "$POST" = ok ]; then
+    ok "T9 carrier ip removed: traffic stopped, instance alive; restored: resumed"
+else
+    bad "T9 carrier outage: pre=$PRE down=$DOWN alive=$ALIVE post=$POST"
+    tail -n 5 "$SRV_LOG" "$CLI_LOG"
+fi
+
+# ---------- T10: default-route flap (wifi cut, cable takes over) ----------
+# The client moves into its own netns with two uplinks to the SAME server
+# address; no local pin: every datagram takes whatever source the routing
+# table prefers.  Cutting wifi must cost nothing but a few lost frames.
+srv_down; cli_down
+sleep 0.5
+ip netns add "$NS_CLI"
+for p in wifi cable; do
+    case $p in
+        wifi)  CDEV=cw0; SDEV=w0a; NET=$WIFI_NET;   METRIC=50 ;;
+        cable) CDEV=cw1; SDEV=w0b; NET=$CABLE_NET;  METRIC=100 ;;
+    esac
+    ip link add "$CDEV" type veth peer name "$SDEV"
+    ip link set "$SDEV" netns "$NS_SRV"
+    ip link set "$CDEV" netns "$NS_CLI"
+    ip -n "$NS_SRV" addr add "$NET.1/24" dev "$SDEV"
+    ip -n "$NS_CLI" addr add "$NET.10/24" dev "$CDEV"
+    ip -n "$NS_SRV" link set "$SDEV" up
+    ip -n "$NS_CLI" link set "$CDEV" up
+done
+ip -n "$NS_CLI" link set lo up
+ip -n "$NS_CLI" route add default via "$WIFI_NET.1" dev cw0 metric 50
+ip -n "$NS_CLI" route add default via "$CABLE_NET.1" dev cw1 metric 100
+
+srv_up
+sleep 0.6
+# unpinned client: remote is the server's one address, reachable via either ISP
+ip netns exec "$NS_CLI" ./a2tpctl cli add "$TAP" remote "$WIFI_NET.1" \
+    local-port 0 >>"$CLI_LOG" 2>&1
+ip -n "$NS_CLI" link set "$TAP" up
+sleep 1
+ip -n "$NS_CLI" addr replace "$TAP_IP/24" dev "$TAP"
+
+ip netns exec "$NS_CLI" ping -I "$TAP" -c 3 -W 2 "$LAN_IP" >/dev/null 2>&1 \
+    && PRE=ok || PRE=fail
+PEER_WIFI=$(peer)
+
+ip -n "$NS_CLI" link set cw0 down	# wifi gone; cable default takes over
+sleep 1
+# no reconfiguration anywhere: the same instance pair must come back on its own
+ip netns exec "$NS_CLI" ping -I "$TAP" -c 3 -W 2 "$LAN_IP" >/dev/null 2>&1 \
+    && POST=ok || POST=fail
+PEER_CABLE=$(peer)
+ip -n "$NS_CLI" link show "$TAP" >/dev/null 2>&1 && TAP_OK=ok || TAP_OK=fail
+ip netns exec "$NS_SRV" ./a2tpctl srv status | grep -q "^srv $V_SRV:" \
+    && SRV_OK=ok || SRV_OK=fail
+
+if [ "$PRE" = ok ] && [ "$POST" = ok ] && [ "$TAP_OK" = ok ] && [ "$SRV_OK" = ok ] \
+   && [ "$PEER_WIFI" != "$PEER_CABLE" ] \
+   && [ "${PEER_WIFI%%:*}" = "$WIFI_NET.10" ] \
+   && [ "${PEER_CABLE%%:*}" = "$CABLE_NET.10" ]; then
+    ok "T10 default-route flap: source $WIFI_NET.10 -> $CABLE_NET.10, same server instance re-learned ($PEER_WIFI -> $PEER_CABLE)"
+else
+    bad "T10 route flap: pre=$PRE post=$POST tap=$TAP_OK srv=$SRV_OK peer '$PEER_WIFI' -> '$PEER_CABLE'"
+    tail -n 5 "$SRV_LOG" "$CLI_LOG"
+fi
+ip netns del "$NS_CLI" 2>/dev/null
 
 # ---------- summary ----------
 say ""

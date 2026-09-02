@@ -6,3 +6,4 @@ a2tp-cli
 # editor / OS noise
 *.swp
 *~
+build/

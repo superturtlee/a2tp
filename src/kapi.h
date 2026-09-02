@@ -28,15 +28,21 @@ enum {
 	A2TP_ATTR_UNSPEC,
 	A2TP_ATTR_IFNAME,	/* string */
 	A2TP_ATTR_PORT,		/* u16, local UDP port (host order) */
-	A2TP_ATTR_BIND_IP,	/* u32 (network order), 0 = INADDR_ANY */
+	A2TP_ATTR_BIND_IP,	/* u32 (network order), v4 bind (with
+				 * BIND_IP6 absent: v4 wildcard) */
+	A2TP_ATTR_BIND_IP6,	/* in6_addr (16B network order), v6 bind */
 	A2TP_ATTR_PEER_IP,	/* u32 (network order) */
+	A2TP_ATTR_PEER_IP6,	/* in6_addr (16B network order) */
 	A2TP_ATTR_PEER_PORT,	/* u16 (network order) */
 	A2TP_ATTR_PEER_FIXED,	/* flag: --peer given, learn nothing */
 	A2TP_ATTR_PEER_TIMEOUT,	/* u32, ms (0 = never expires) */
 	A2TP_ATTR_PEER_KNOWN,	/* flag (reply): a peer was learned */
 	A2TP_ATTR_PEER_AGE_MS,	/* u64 (reply): ms since last peer packet */
 	A2TP_ATTR_NO_SELF_FILTER,/* flag: do not filter the tunnel's own UDP */
-	A2TP_ATTR_FILTER_IP,	/* nested: u32 (network order) list */
+	A2TP_ATTR_FILTER_IP,	/* nested array, each entry nested:
+				 * { FILTER_ADDR u32, FILTER_MASK u32 } */
+	A2TP_ATTR_FILTER_IP6,	/* nested array, each entry nested:
+				 * { FILTER_ADDR in6, FILTER_MASK in6 } */
 	A2TP_ATTR_STATS,	/* nested: u64 list, enum a2tp_stat order
 				 * (kept in sync with kernel/a2tp.h) */
 	A2TP_ATTR_ERRMSG,	/* string: kernel-side error detail */
@@ -44,6 +50,22 @@ enum {
 	__A2TP_ATTR_MAX,
 };
 #define A2TP_ATTR_MAX (__A2TP_ATTR_MAX - 1)
+
+/* one --filter-ip / --filter-ip6 entry is an (address, netmask) pair; a frame
+ * matches when (dst & mask) == (addr & mask).  A bare address means an
+ * all-ones mask (exact match).  The mask may be written as an address-style
+ * mask (255.255.255.0, ffff:ffff::) or as a prefix length (10.0.0.0/24,
+ * fd00::/64).  addr is stored pre-masked (host bits cleared).  Pure mask
+ * semantics on the kernel side: no address/network distinction, no
+ * contiguity requirement.  Max combined entries per server instance: */
+#define A2TP_FILTER_MAX		32
+
+enum {
+	A2TP_FILTER_UNSPEC,
+	A2TP_FILTER_ADDR,
+	A2TP_FILTER_MASK,
+	__A2TP_FILTER_MAX,
+};
 
 /* per-stat order, shared by the kernel counters and a2tpctl's display;
  * each side defines a2tp_kstat_name[] in this order */
@@ -71,9 +93,16 @@ extern const char *const a2tp_kstat_name[A2TP_KSTAT_NR];
 
 enum {
 	IFLA_A2TP_UNSPEC,
-	IFLA_A2TP_REMOTE_IP,	/* u32 (network order) */
+	IFLA_A2TP_REMOTE_IP,	/* u32 (network order); exactly one of
+				 * REMOTE_IP / REMOTE_IP6 is required */
+	IFLA_A2TP_REMOTE_IP6,	/* in6_addr (16B network order) */
 	IFLA_A2TP_REMOTE_PORT,	/* u16 (network order), default A2TP_UDP_PORT */
 	IFLA_A2TP_LOCAL_PORT,	/* u16 (host order), 0 = ephemeral */
+	IFLA_A2TP_LOCAL_IP,	/* u32: pin the carrier (source address).
+				 * Absent = source follows the routing table
+				 * (default-route following).  Family must
+				 * match the remote. */
+	IFLA_A2TP_LOCAL_IP6,	/* in6_addr: same, v6 */
 	IFLA_A2TP_KEEPALIVE_MS,	/* u32, 0 = disabled */
 	__IFLA_A2TP_MAX,
 };

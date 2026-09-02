@@ -1,17 +1,24 @@
 // SPDX-License-Identifier: GPL-2.0
 /* a2tp_srv.c - server side: the frame pump installed on a physical NIC
  *
- *	a2tpctl srv add -i eth0 [--peer 1.2.3.4:1702] [--filter-ip ..]
+ *	a2tpctl srv add -i eth0 [--peer 1.2.3.4:1702]
+ *	                         [--filter-ip 10.0.0.0/255.255.255.0,...]
+ *	                         [--filter-ip6 fd00::/64,...] [-b <carrier>]
  *
  * No netdev of its own (the userspace design has none either): an
  * rx_handler -- the same hook the bridge uses -- is registered on the
  * taken-over NIC.  Each received frame is examined, and if it passes the
  * filters a clone is prefixed with the a2tp type byte and sent to the peer
  * over the kernel UDP socket; the frame itself always continues up the
- * stack (RX_HANDLER_PASS), so the mirror is a passive tap, exactly like
- * the AF_PACKET socket it replaces.  Datagrams from the peer are
- * decapsulated and transmitted on the NIC with dev_queue_xmit(), like an
- * AF_PACKET raw send.
+ * stack (RX_HANDLER_PASS), so the mirror is a passive tap, exactly like the
+ * AF_PACKET socket it replaces.  Datagrams from the peer are decapsulated
+ * and transmitted on the NIC with dev_queue_xmit(), like an AF_PACKET raw
+ * send.
+ *
+ * The underlay endpoint (struct a2tp_ep) holds one v4 and one v6-only
+ * socket unless -b pinned a single family; the instance outlives any
+ * underlay outage because nothing on the transmit path is cached (see
+ * a2tp_core.c).
  */
 
 #include <linux/module.h>
@@ -25,6 +32,7 @@
 #include <net/genetlink.h>
 #include <net/udp_tunnel.h>
 #include <net/ip.h>
+#include <net/ipv6.h>
 #include <net/xfrm.h>
 #include <net/net_namespace.h>
 
@@ -107,14 +115,13 @@ static rx_handler_result_t a2tp_srv_frame(struct sk_buff **pskb)
 	 * tunnel" echo loops are born (userspace --no-self-filter to opt out,
 	 * e.g. when a2tp runs inside another a2tp on purpose) */
 	if (srv->self_filter) {
-		struct a2tp_peer selfp = {};
+		struct a2tp_peer selfp = {};	/* zero = unknown, ports only */
 
 		if (srv->peer_fixed)
 			selfp = srv->peer;
 		else
-			a2tp_srv_peer_get(srv, &selfp);	/* zero when unknown */
-		if (a2tp_frame_is_tunnel_l4(skb, srv->local_port,
-					    selfp.ip, selfp.port)) {
+			a2tp_peer_get(&srv->learned, &selfp);
+		if (a2tp_frame_is_tunnel_l4(skb, srv->local_port, &selfp)) {
 			a2tp_stat(srv->stats, A2TP_KSTAT_PASS_SELF);
 			return RX_HANDLER_PASS;
 		}
@@ -128,7 +135,8 @@ static rx_handler_result_t a2tp_srv_frame(struct sk_buff **pskb)
 
 	if (srv->peer_fixed) {
 		peer = srv->peer;
-	} else if (!a2tp_srv_peer_get(srv, &peer) || a2tp_peer_expired(srv)) {
+	} else if (!a2tp_peer_get(&srv->learned, &peer) ||
+		   a2tp_peer_expired(srv)) {
 		/* nobody has talked to us yet (or for a while): hold the
 		 * mirror until the next packet re-learns the endpoint */
 		a2tp_stat(srv->stats, A2TP_KSTAT_PASS_NO_PEER);
@@ -139,6 +147,13 @@ static rx_handler_result_t a2tp_srv_frame(struct sk_buff **pskb)
 	if (!clone)
 		return RX_HANDLER_PASS;
 
+	/* the clone still carries how the NIC classified the *captured*
+	 * frame: a unicast frame for the client's taken-over address is
+	 * PACKET_OTHERHOST, and ip6_rcv_core() drops such skbs.  v4's
+	 * iptunnel_xmit() scrubs this away for us; v6's ip6tunnel_xmit()
+	 * does not, so scrub here once for both families */
+	skb_scrub_packet(clone, false);
+
 	/* re-push the ethernet header (data sits at L3 after
 	 * eth_type_trans), then the type byte; cow for the UDP/IP headers */
 	if (skb_cow_head(clone, LL_MAX_HEADER + HDR_LEN)) {
@@ -148,7 +163,9 @@ static rx_handler_result_t a2tp_srv_frame(struct sk_buff **pskb)
 	__skb_push(clone, mac_len + HDR_LEN);
 	*(u8 *)clone->data = A2TP_TYPE_DATA;
 
-	if (!a2tp_xmit(srv->sock, clone, &peer)) {
+	if (!a2tp_xmit(&srv->ep, clone, &peer)) {
+		/* the underlay is (temporarily) gone; the frame stays with the
+		 * local stack either way and the instance lives on */
 		a2tp_stat(srv->stats, A2TP_KSTAT_TX_ERR);
 		return RX_HANDLER_PASS;
 	}
@@ -163,10 +180,7 @@ static rx_handler_result_t a2tp_srv_frame(struct sk_buff **pskb)
 static int a2tp_srv_encap_recv(struct sock *sk, struct sk_buff *skb)
 {
 	struct a2tp_srv *srv = rcu_dereference_sk_user_data(sk);
-	struct a2tp_peer src = {
-		.ip	= ip_hdr(skb)->saddr,
-		.port	= udp_hdr(skb)->source,
-	};
+	struct a2tp_peer src = {};
 	u8 type;
 
 	if (unlikely(!srv))
@@ -180,6 +194,8 @@ static int a2tp_srv_encap_recv(struct sock *sk, struct sk_buff *skb)
 		goto bad;
 	type = *(u8 *)skb->data;
 
+	a2tp_skb_src_peer(skb, &src);
+
 	if (srv->peer_fixed) {
 		if (!a2tp_peer_eq(&src, &srv->peer)) {
 			/* --peer locks the one allowed source: anything
@@ -189,7 +205,7 @@ static int a2tp_srv_encap_recv(struct sock *sk, struct sk_buff *skb)
 		}
 	} else {
 		/* every datagram refreshes the peer (NAT roaming) */
-		a2tp_srv_peer_update(srv, &src);
+		a2tp_srv_peer_learn(srv, &src);
 	}
 
 	if (type == A2TP_TYPE_KEEPALIVE) {
@@ -227,6 +243,18 @@ drop:
 
 /* ---------------- instance lifecycle, rtnl held ---------------- */
 
+/* parsed A2TP_CMD_SRV_ADD payload, gathered before creating anything */
+struct a2tp_srv_cfg {
+	u16			local_port;	/* A2TP_UDP_PORT default */
+	struct a2tp_addr	bind;		/* AF_UNSPEC: dual-stack wildcards */
+	bool			self_filter;
+	u32			peer_timeout_ms;	/* 30s default */
+	bool			peer_fixed;
+	struct a2tp_peer	peer;		/* valid when peer_fixed */
+	struct a2tp_filter	filter[A2TP_FILTER_MAX];
+	int			filter_n;
+};
+
 /* caller holds rtnl; @restore_promisc false when the device is dying
  * (NETDEV_UNREGISTER) and its state is being torn down anyway */
 void a2tp_srv_destroy(struct a2tp_srv *srv, bool restore_promisc)
@@ -237,20 +265,17 @@ void a2tp_srv_destroy(struct a2tp_srv *srv, bool restore_promisc)
 	if (restore_promisc && !srv->was_promisc)
 		dev_set_promiscuity(srv->dev, -1);
 
-	a2tp_sock_close(srv->sock);
+	a2tp_ep_close(&srv->ep);
 	dev_put(srv->dev);
 	free_percpu(srv->stats);
 	kfree(srv);
 }
 
 static struct a2tp_srv *a2tp_srv_create(struct net *net, const char *ifname,
-					u16 local_port, __be32 bind_ip,
-					bool self_filter, u32 peer_timeout_ms,
-					bool peer_fixed,
-					struct a2tp_peer peer,
-					const __be32 *filter_ip, int filter_n)
+					const struct a2tp_srv_cfg *cfg)
 {
 	struct a2tp_net *an = net_generic(net, a2tp_net_id);
+	bool open_v4, open_v6;
 	struct net_device *dev;
 	struct a2tp_srv *srv;
 	int err;
@@ -278,20 +303,34 @@ static struct a2tp_srv *a2tp_srv_create(struct net *net, const char *ifname,
 
 	srv->net = net;
 	srv->dev = dev;
-	srv->local_port = local_port;
-	srv->bind_ip = bind_ip;
-	srv->self_filter = self_filter;
-	srv->peer_timeout_ms = peer_timeout_ms;
-	srv->peer_fixed = peer_fixed;
-	srv->peer = peer;
-	srv->filter_n = filter_n;
-	memcpy(srv->filter_ip, filter_ip, filter_n * sizeof(*filter_ip));
+	srv->local_port = cfg->local_port;
+	srv->self_filter = cfg->self_filter;
+	srv->peer_timeout_ms = cfg->peer_timeout_ms;
+	srv->peer_fixed = cfg->peer_fixed;
+	srv->peer = cfg->peer;
+	srv->filter_n = cfg->filter_n;
+	memcpy(srv->filter, cfg->filter, cfg->filter_n * sizeof(cfg->filter[0]));
+	spin_lock_init(&srv->learned.lock);
 
-	/* open the socket before installing the handler so the mirror path
+	/* no -b: one wildcard socket per family (the v6 one is v6-only so
+	 * both can hold the same port); with -b, the carrier's family alone */
+	if (cfg->bind.family == AF_INET) {
+		open_v4 = true;
+		open_v6 = false;
+	} else if (cfg->bind.family == AF_INET6) {
+		open_v4 = false;
+		open_v6 = true;
+	} else {
+		open_v4 = true;
+		open_v6 = true;
+	}
+
+	/* open the sockets before installing the handler so the mirror path
 	 * can never see a half-built instance (bind conflicts surface here
 	 * as -EADDRINUSE, same as the userspace udp_bind) */
-	err = a2tp_sock_open(net, bind_ip, local_port, a2tp_srv_encap_recv,
-			     srv, &srv->sock);
+	err = a2tp_ep_open(net, cfg->bind.family ? &cfg->bind : NULL,
+			   open_v4, open_v6, cfg->local_port,
+			   a2tp_srv_encap_recv, srv, &srv->ep);
 	if (err)
 		goto err_stats;
 
@@ -311,7 +350,7 @@ err_promisc:
 	if (!srv->was_promisc)
 		dev_set_promiscuity(dev, -1);
 err_sock:
-	a2tp_sock_close(srv->sock);
+	a2tp_ep_close(&srv->ep);
 err_stats:
 	free_percpu(srv->stats);
 err_free:
@@ -345,17 +384,54 @@ static struct notifier_block a2tp_netdev_nb = {
 
 /* ---------------- genl control plane ---------------- */
 
+/* inner policy of one filter array element: {ADDR u32, MASK u32} or the
+ * 16-byte v6 equivalents; enforced exact-len so nothing is ever read past
+ * the attribute */
+static const struct nla_policy a2tp_filter4_policy[__A2TP_FILTER_MAX] = {
+	[A2TP_FILTER_ADDR]	= NLA_POLICY_EXACT_LEN(4),
+	[A2TP_FILTER_MASK]	= NLA_POLICY_EXACT_LEN(4),
+};
+
+static const struct nla_policy a2tp_filter6_policy[__A2TP_FILTER_MAX] = {
+	[A2TP_FILTER_ADDR]	= NLA_POLICY_EXACT_LEN(16),
+	[A2TP_FILTER_MASK]	= NLA_POLICY_EXACT_LEN(16),
+};
+
 static const struct nla_policy a2tp_nl_policy[A2TP_ATTR_MAX + 1] = {
 	[A2TP_ATTR_IFNAME]	= { .type = NLA_STRING, .len = IFNAMSIZ - 1 },
 	[A2TP_ATTR_PORT]	= { .type = NLA_U16 },
 	[A2TP_ATTR_BIND_IP]	= { .type = NLA_U32 },
+	[A2TP_ATTR_BIND_IP6]	= NLA_POLICY_EXACT_LEN(sizeof(struct in6_addr)),
 	[A2TP_ATTR_PEER_IP]	= { .type = NLA_U32 },
+	[A2TP_ATTR_PEER_IP6]	= NLA_POLICY_EXACT_LEN(sizeof(struct in6_addr)),
 	[A2TP_ATTR_PEER_PORT]	= { .type = NLA_U16 },
 	[A2TP_ATTR_PEER_TIMEOUT]	= { .type = NLA_U32 },
 	[A2TP_ATTR_NO_SELF_FILTER]	= { .type = NLA_FLAG },
 	[A2TP_ATTR_PEER_FIXED]	= { .type = NLA_FLAG },
-	[A2TP_ATTR_FILTER_IP]	= { .type = NLA_NESTED },
+	[A2TP_ATTR_FILTER_IP]	= NLA_POLICY_NESTED_ARRAY(a2tp_filter4_policy),
+	[A2TP_ATTR_FILTER_IP6]	= NLA_POLICY_NESTED_ARRAY(a2tp_filter6_policy),
 };
+
+/* one --filter-ip / --filter-ip6 entry into the reply */
+static int a2tp_fill_one_filter(struct sk_buff *skb,
+				const struct a2tp_filter *f)
+{
+	struct nlattr *nest;
+	size_t len = f->addr.family == AF_INET ? 4 : 16;
+
+	nest = nla_nest_start(skb, 1 /* dummy type */);
+	if (!nest)
+		return -EMSGSIZE;
+	if (nla_put(skb, A2TP_FILTER_ADDR, len, &f->addr) ||
+	    nla_put(skb, A2TP_FILTER_MASK, len, &f->mask))
+		goto nla_put_failure;
+	nla_nest_end(skb, nest);
+	return 0;
+
+nla_put_failure:
+	nla_nest_cancel(skb, nest);
+	return -EMSGSIZE;
+}
 
 /* one reply message describing @srv; used by SRV_ADD and SRV_GET */
 static int a2tp_srv_fill(struct sk_buff *skb, u32 portid, u32 seq, int flags,
@@ -375,44 +451,73 @@ static int a2tp_srv_fill(struct sk_buff *skb, u32 portid, u32 seq, int flags,
 
 	if (nla_put_string(skb, A2TP_ATTR_IFNAME, srv->dev->name) ||
 	    nla_put_u16(skb, A2TP_ATTR_PORT, srv->local_port) ||
-	    nla_put_u32(skb, A2TP_ATTR_BIND_IP, (__force u32)srv->bind_ip) ||
 	    nla_put_u32(skb, A2TP_ATTR_PEER_TIMEOUT, srv->peer_timeout_ms))
 		goto nla_put_failure;
 
-	if (srv->peer_fixed &&
-	    (nla_put_flag(skb, A2TP_ATTR_PEER_FIXED) ||
-	     nla_put_u32(skb, A2TP_ATTR_PEER_IP, (__force u32)srv->peer.ip) ||
-	     nla_put_u16(skb, A2TP_ATTR_PEER_PORT,
-			 (__force u16)srv->peer.port)))
+	if (srv->ep.local.family == AF_INET &&
+	    nla_put_u32(skb, A2TP_ATTR_BIND_IP,
+			(__force u32)srv->ep.local.v4))
+		goto nla_put_failure;
+	if (srv->ep.local.family == AF_INET6 &&
+	    nla_put_in6_addr(skb, A2TP_ATTR_BIND_IP6, &srv->ep.local.v6))
 		goto nla_put_failure;
 
-	if (!srv->peer_fixed) {
-		known = a2tp_srv_peer_get(srv, &peer);
+	if (srv->peer_fixed) {
+		if (nla_put_flag(skb, A2TP_ATTR_PEER_FIXED))
+			goto nla_put_failure;
+		peer = srv->peer;
+	} else {
+		known = a2tp_peer_get_proc(&srv->learned, &peer);
+		if (known && nla_put_flag(skb, A2TP_ATTR_PEER_KNOWN))
+			goto nla_put_failure;
+	}
+	if (srv->peer_fixed || known) {
+		int bad;
+
+		if (peer.a.family == AF_INET6)
+			bad = nla_put_in6_addr(skb, A2TP_ATTR_PEER_IP6,
+					       &peer.a.v6);
+		else
+			bad = nla_put_u32(skb, A2TP_ATTR_PEER_IP,
+					  (__force u32)peer.a.v4);
+		if (bad ||
+		    nla_put_u16(skb, A2TP_ATTR_PEER_PORT,
+				(__force u16)peer.port))
+			goto nla_put_failure;
 		if (known &&
-		    (nla_put_flag(skb, A2TP_ATTR_PEER_KNOWN) ||
-		     nla_put_u32(skb, A2TP_ATTR_PEER_IP,
-				 (__force u32)peer.ip) ||
-		     nla_put_u16(skb, A2TP_ATTR_PEER_PORT,
-				 (__force u16)peer.port) ||
-		     nla_put_u64_64bit(skb, A2TP_ATTR_PEER_AGE_MS,
-				       ktime_get_boottime_ns() / NSEC_PER_MSEC -
-				       a2tp_srv_peer_last_ms(srv),
-				       A2TP_ATTR_PAD)))
+		    nla_put_u64_64bit(skb, A2TP_ATTR_PEER_AGE_MS,
+				      ktime_get_boottime_ns() / NSEC_PER_MSEC -
+				      atomic64_read(&srv->peer_last_ms),
+				      A2TP_ATTR_PAD))
 			goto nla_put_failure;
 	}
 
 	if (srv->filter_n) {
-		nest = nla_nest_start_noflag(skb, A2TP_ATTR_FILTER_IP);
-		if (!nest)
-			goto nla_put_failure;
-		for (i = 0; i < srv->filter_n; i++)
-			if (nla_put_u32(skb, i /* dummy type */,
-					(__force u32)srv->filter_ip[i]))
+		struct nlattr *nest4 = NULL, *nest6 = NULL;
+
+		/* two arrays, one per family, opened lazily */
+		for (i = 0; i < srv->filter_n; i++) {
+			const struct a2tp_filter *f = &srv->filter[i];
+
+			if (f->addr.family == AF_INET && !nest4) {
+				nest4 = nla_nest_start(skb, A2TP_ATTR_FILTER_IP);
+				if (!nest4)
+					goto nla_put_failure;
+			} else if (f->addr.family == AF_INET6 && !nest6) {
+				nest6 = nla_nest_start(skb, A2TP_ATTR_FILTER_IP6);
+				if (!nest6)
+					goto nla_put_failure;
+			}
+			if (a2tp_fill_one_filter(skb, f))
 				goto nla_put_failure;
-		nla_nest_end(skb, nest);
+		}
+		if (nest4)
+			nla_nest_end(skb, nest4);
+		if (nest6)
+			nla_nest_end(skb, nest6);
 	}
 
-	nest = nla_nest_start_noflag(skb, A2TP_ATTR_STATS);
+	nest = nla_nest_start(skb, A2TP_ATTR_STATS);
 	if (!nest)
 		goto nla_put_failure;
 	for (i = 0; i < A2TP_KSTAT_NR; i++) {
@@ -430,18 +535,57 @@ nla_put_failure:
 	return -EMSGSIZE;
 }
 
+/* walk one nested filter array into cfg->filter[]; entries are stored
+ * pre-masked (addr &= mask) so the match itself stays a pure compare */
+static int a2tp_parse_filter_array(struct nlattr *nest,
+				   const struct nla_policy *policy,
+				   struct a2tp_srv_cfg *cfg,
+				   struct netlink_ext_ack *extack)
+{
+	struct nlattr *ft[__A2TP_FILTER_MAX] = {};
+	struct nlattr *na;
+	bool v6 = policy == a2tp_filter6_policy;
+	int rem, err;
+
+	nla_for_each_nested(na, nest, rem) {
+		struct a2tp_filter *f;
+
+		if (cfg->filter_n >= A2TP_FILTER_MAX) {
+			NL_SET_ERR_MSG(extack, "too many filter entries");
+			return -E2BIG;
+		}
+		err = nla_parse_nested(ft, __A2TP_FILTER_MAX - 1, na, policy,
+				       extack);
+		if (err)
+			return err;
+		if (!ft[A2TP_FILTER_ADDR] || !ft[A2TP_FILTER_MASK]) {
+			NL_SET_ERR_MSG(extack, "filter entry needs addr and mask");
+			return -EINVAL;
+		}
+
+		f = &cfg->filter[cfg->filter_n++];
+		f->addr.family = f->mask.family = v6 ? AF_INET6 : AF_INET;
+		memcpy(&f->addr.v6, nla_data(ft[A2TP_FILTER_ADDR]),
+		       v6 ? 16 : 4);
+		memcpy(&f->mask.v6, nla_data(ft[A2TP_FILTER_MASK]),
+		       v6 ? 16 : 4);
+		a2tp_addr_and(&f->addr, &f->addr, &f->mask);
+	}
+	return 0;
+}
+
 static int a2tp_nl_srv_add(struct sk_buff *skb, struct genl_info *info)
 {
 	struct net *net = genl_info_net(info);
-	struct nlattr *na, *nest = info->attrs[A2TP_ATTR_FILTER_IP];
+	struct a2tp_srv_cfg cfg = {
+		.local_port		= A2TP_UDP_PORT,
+		.self_filter		= true,
+		.peer_timeout_ms	= 30000,
+	};
 	const char *ifname;
 	struct a2tp_srv *srv;
-	int rem, filter_n = 0;
-	struct a2tp_peer peer = {};
-	u16 local_port = A2TP_UDP_PORT;
-	u32 peer_timeout_ms = 30000;
-	__be32 filter_ip[A2TP_FILTER_IP_MAX];
 	struct sk_buff *rep = NULL;
+	bool have_v4, have_v6;
 	int err;
 
 	if (!info->attrs[A2TP_ATTR_IFNAME])
@@ -449,38 +593,66 @@ static int a2tp_nl_srv_add(struct sk_buff *skb, struct genl_info *info)
 	ifname = nla_data(info->attrs[A2TP_ATTR_IFNAME]);
 
 	if (info->attrs[A2TP_ATTR_PORT])
-		local_port = nla_get_u16(info->attrs[A2TP_ATTR_PORT]);
+		cfg.local_port = nla_get_u16(info->attrs[A2TP_ATTR_PORT]);
 	if (info->attrs[A2TP_ATTR_PEER_TIMEOUT])
-		peer_timeout_ms = nla_get_u32(info->attrs[A2TP_ATTR_PEER_TIMEOUT]);
+		cfg.peer_timeout_ms =
+			nla_get_u32(info->attrs[A2TP_ATTR_PEER_TIMEOUT]);
+	cfg.self_filter = !info->attrs[A2TP_ATTR_NO_SELF_FILTER];
 
-	if (info->attrs[A2TP_ATTR_PEER_FIXED]) {
-		if (!info->attrs[A2TP_ATTR_PEER_IP] ||
-		    !info->attrs[A2TP_ATTR_PEER_PORT])
-			return -EINVAL;
-		peer.ip = (__force __be32)nla_get_u32(info->attrs[A2TP_ATTR_PEER_IP]);
-		peer.port = nla_get_be16(info->attrs[A2TP_ATTR_PEER_PORT]);
+	/* the carrier: -b 1.2.3.4 / -b fd00::1; absent = dual-stack wildcards */
+	if (info->attrs[A2TP_ATTR_BIND_IP] && info->attrs[A2TP_ATTR_BIND_IP6]) {
+		NL_SET_ERR_MSG(info->extack,
+			       "bind ip and bind ip6 are mutually exclusive");
+		return -EINVAL;
+	}
+	if (info->attrs[A2TP_ATTR_BIND_IP]) {
+		cfg.bind.family = AF_INET;
+		cfg.bind.v4 = (__force __be32)
+			nla_get_u32(info->attrs[A2TP_ATTR_BIND_IP]);
+	} else if (info->attrs[A2TP_ATTR_BIND_IP6]) {
+		cfg.bind.family = AF_INET6;
+		cfg.bind.v6 = nla_get_in6_addr(info->attrs[A2TP_ATTR_BIND_IP6]);
 	}
 
-	if (nest) {
-		nla_for_each_nested(na, nest, rem) {
-			if (filter_n >= A2TP_FILTER_IP_MAX)
-				return -E2BIG;
-			filter_ip[filter_n++] =
-				(__force __be32)nla_get_u32(na);
+	if (info->attrs[A2TP_ATTR_PEER_FIXED]) {
+		have_v4 = info->attrs[A2TP_ATTR_PEER_IP];
+		have_v6 = info->attrs[A2TP_ATTR_PEER_IP6];
+		if (have_v4 == have_v6 || !info->attrs[A2TP_ATTR_PEER_PORT]) {
+			NL_SET_ERR_MSG(info->extack,
+				       "--peer needs exactly one address and a port");
+			return -EINVAL;
 		}
+		cfg.peer_fixed = true;
+		cfg.peer.a.family = have_v4 ? AF_INET : AF_INET6;
+		if (have_v4)
+			cfg.peer.a.v4 = (__force __be32)
+				nla_get_u32(info->attrs[A2TP_ATTR_PEER_IP]);
+		else
+			cfg.peer.a.v6 =
+				nla_get_in6_addr(info->attrs[A2TP_ATTR_PEER_IP6]);
+		cfg.peer.port = nla_get_be16(info->attrs[A2TP_ATTR_PEER_PORT]);
+	}
+
+	if (info->attrs[A2TP_ATTR_FILTER_IP]) {
+		err = a2tp_parse_filter_array(info->attrs[A2TP_ATTR_FILTER_IP],
+					      a2tp_filter4_policy, &cfg,
+					      info->extack);
+		if (err)
+			return err;
+	}
+	if (info->attrs[A2TP_ATTR_FILTER_IP6]) {
+		err = a2tp_parse_filter_array(info->attrs[A2TP_ATTR_FILTER_IP6],
+					      a2tp_filter6_policy, &cfg,
+					      info->extack);
+		if (err)
+			return err;
 	}
 
 	rtnl_lock();
 	if (a2tp_srv_find(net, ifname)) {
 		err = -EEXIST;
 	} else {
-		srv = a2tp_srv_create(net, ifname, local_port,
-				      info->attrs[A2TP_ATTR_BIND_IP] ?
-					(__force __be32)nla_get_u32(info->attrs[A2TP_ATTR_BIND_IP]) : 0,
-				      !info->attrs[A2TP_ATTR_NO_SELF_FILTER],
-				      peer_timeout_ms,
-				      !!info->attrs[A2TP_ATTR_PEER_FIXED],
-				      peer, filter_ip, filter_n);
+		srv = a2tp_srv_create(net, ifname, &cfg);
 		err = PTR_ERR_OR_ZERO(srv);
 	}
 	/* build the reply under the lock: a concurrent srv del must not be

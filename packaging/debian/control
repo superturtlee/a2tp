@@ -1,0 +1,18 @@
+Package: a2tp-dkms
+Version: @VER@
+Section: net
+Priority: optional
+Architecture: amd64
+Depends: dkms
+Recommends: linux-headers-amd64 | linux-headers-generic
+Maintainer: a2tp project
+Description: a2tp kernel-mode L2 pseudowire (DKMS)
+ a2tp ("another layer2 transport") Ethernet-over-UDP pseudowire with the
+ whole data plane inside a loadable kernel module: server side mirrors and
+ injects frames on a taken-over NIC via rx_handler, client side exposes a
+ rtnl_link netdev. Wire format is identical to the userspace a2tp tools.
+ .
+ This package ships the module sources under /usr/src and registers them
+ with DKMS (auto-rebuild on kernel updates), plus the a2tpctl control
+ utility. No encryption/authentication: run it over a trusted network or
+ layer WireGuard/IPsec on top.

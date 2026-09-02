@@ -1,0 +1,19 @@
+#!/bin/bash
+# a2tp-dkms postinst: register sources with dkms and build for the running
+# kernel. Build failure is not fatal (e.g. headers not installed yet) --
+# sources stay registered and AUTOINSTALL rebuilds when a kernel appears.
+set -e
+PKG=a2tp
+VER=@VER@
+
+if [ "$1" = configure ]; then
+	/usr/sbin/dkms add -m "$PKG" -v "$VER" >/dev/null 2>&1 || true
+	if /usr/sbin/dkms build -m "$PKG" -v "$VER" >/var/log/a2tp-dkms-build.log 2>&1; then
+		/usr/sbin/dkms install -m "$PKG" -v "$VER" >>/var/log/a2tp-dkms-build.log 2>&1 || true
+	else
+		echo "a2tp-dkms: module build failed, see /var/log/a2tp-dkms-build.log" >&2
+	fi
+	# 硬依赖在独立模块里（v6 符号不在 udp_tunnel.ko），modprobe 会自动带上
+	modprobe a2tp 2>/dev/null || true
+fi
+exit 0

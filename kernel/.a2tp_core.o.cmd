@@ -3,6 +3,7 @@ savedcmd_a2tp_core.o := gcc -Wp,-MMD,./.a2tp_core.o.d -nostdinc -I/usr/src/linux
 source_a2tp_core.o := a2tp_core.c
 
 deps_a2tp_core.o := \
+    $(wildcard include/config/IPV6) \
   /usr/src/linux-headers-7.0.0-30-generic/include/linux/compiler-version.h \
     $(wildcard include/config/CC_VERSION_TEXT) \
   /usr/src/linux-headers-7.0.0-30-generic/include/linux/kconfig.h \
@@ -1345,7 +1346,6 @@ deps_a2tp_core.o := \
     $(wildcard include/config/NETFILTER_EGRESS) \
     $(wildcard include/config/WIRELESS_EXT) \
     $(wildcard include/config/NET_L3_MASTER_DEV) \
-    $(wildcard include/config/IPV6) \
     $(wildcard include/config/TLS_DEVICE) \
     $(wildcard include/config/NET_DSA) \
     $(wildcard include/config/TIPC) \
@@ -1627,9 +1627,18 @@ deps_a2tp_core.o := \
   /usr/src/linux-headers-7.0.0-30-generic/include/uapi/linux/if_vlan.h \
   /usr/src/linux-headers-7.0.0-30-generic/include/linux/ip.h \
   /usr/src/linux-headers-7.0.0-30-generic/include/uapi/linux/ip.h \
-  /usr/src/linux-headers-7.0.0-30-generic/include/linux/udp.h \
-  /usr/src/linux-headers-7.0.0-30-generic/include/net/inet_sock.h \
-  /usr/src/linux-headers-7.0.0-30-generic/include/linux/jhash.h \
+  /usr/src/linux-headers-7.0.0-30-generic/include/linux/ipv6.h \
+    $(wildcard include/config/IPV6_ROUTER_PREF) \
+    $(wildcard include/config/IPV6_ROUTE_INFO) \
+    $(wildcard include/config/IPV6_OPTIMISTIC_DAD) \
+    $(wildcard include/config/IPV6_SEG6_HMAC) \
+    $(wildcard include/config/IPV6_MIP6) \
+  /usr/src/linux-headers-7.0.0-30-generic/include/uapi/linux/ipv6.h \
+  /usr/src/linux-headers-7.0.0-30-generic/include/linux/tcp.h \
+    $(wildcard include/config/TCP_AO) \
+    $(wildcard include/config/BPF) \
+    $(wildcard include/config/TCP_MD5SIG) \
+  /usr/src/linux-headers-7.0.0-30-generic/include/linux/win_minmax.h \
   /usr/src/linux-headers-7.0.0-30-generic/include/net/sock.h \
     $(wildcard include/config/SOCK_RX_QUEUE_MAPPING) \
     $(wildcard include/config/SOCK_VALIDATE_XMIT) \
@@ -1652,13 +1661,22 @@ deps_a2tp_core.o := \
   /usr/src/linux-headers-7.0.0-30-generic/include/net/fib_rules.h \
   /usr/src/linux-headers-7.0.0-30-generic/include/uapi/linux/fib_rules.h \
   /usr/src/linux-headers-7.0.0-30-generic/include/net/fib_notifier.h \
+  /usr/src/linux-headers-7.0.0-30-generic/include/net/inet_connection_sock.h \
+  /usr/src/linux-headers-7.0.0-30-generic/include/net/inet_sock.h \
+  /usr/src/linux-headers-7.0.0-30-generic/include/linux/jhash.h \
   /usr/src/linux-headers-7.0.0-30-generic/include/net/request_sock.h \
     $(wildcard include/config/SYN_COOKIES) \
   /usr/src/linux-headers-7.0.0-30-generic/include/net/rstreason.h \
   /usr/src/linux-headers-7.0.0-30-generic/include/uapi/linux/mptcp.h \
   /usr/src/linux-headers-7.0.0-30-generic/include/uapi/linux/mptcp_pm.h \
   /usr/src/linux-headers-7.0.0-30-generic/include/net/netns/hash.h \
+  /usr/src/linux-headers-7.0.0-30-generic/include/net/inet_timewait_sock.h \
+  /usr/src/linux-headers-7.0.0-30-generic/include/net/timewait_sock.h \
+  /usr/src/linux-headers-7.0.0-30-generic/include/uapi/linux/tcp.h \
+  /usr/src/linux-headers-7.0.0-30-generic/include/linux/udp.h \
   /usr/src/linux-headers-7.0.0-30-generic/include/uapi/linux/udp.h \
+  /usr/src/linux-headers-7.0.0-30-generic/include/linux/icmpv6.h \
+    $(wildcard include/config/NF_NAT) \
   /usr/src/linux-headers-7.0.0-30-generic/include/net/udp_tunnel.h \
   /usr/src/linux-headers-7.0.0-30-generic/include/net/ip_tunnels.h \
     $(wildcard include/config/DST_CACHE) \
@@ -1666,22 +1684,6 @@ deps_a2tp_core.o := \
   /usr/src/linux-headers-7.0.0-30-generic/include/linux/if_tunnel.h \
   /usr/src/linux-headers-7.0.0-30-generic/include/uapi/linux/if_tunnel.h \
   /usr/src/linux-headers-7.0.0-30-generic/include/net/dsfield.h \
-  /usr/src/linux-headers-7.0.0-30-generic/include/linux/ipv6.h \
-    $(wildcard include/config/IPV6_ROUTER_PREF) \
-    $(wildcard include/config/IPV6_ROUTE_INFO) \
-    $(wildcard include/config/IPV6_OPTIMISTIC_DAD) \
-    $(wildcard include/config/IPV6_SEG6_HMAC) \
-    $(wildcard include/config/IPV6_MIP6) \
-  /usr/src/linux-headers-7.0.0-30-generic/include/uapi/linux/ipv6.h \
-  /usr/src/linux-headers-7.0.0-30-generic/include/linux/tcp.h \
-    $(wildcard include/config/TCP_AO) \
-    $(wildcard include/config/BPF) \
-    $(wildcard include/config/TCP_MD5SIG) \
-  /usr/src/linux-headers-7.0.0-30-generic/include/linux/win_minmax.h \
-  /usr/src/linux-headers-7.0.0-30-generic/include/net/inet_connection_sock.h \
-  /usr/src/linux-headers-7.0.0-30-generic/include/net/inet_timewait_sock.h \
-  /usr/src/linux-headers-7.0.0-30-generic/include/net/timewait_sock.h \
-  /usr/src/linux-headers-7.0.0-30-generic/include/uapi/linux/tcp.h \
   /usr/src/linux-headers-7.0.0-30-generic/include/net/gro_cells.h \
   /usr/src/linux-headers-7.0.0-30-generic/include/net/inet_ecn.h \
   /usr/src/linux-headers-7.0.0-30-generic/include/net/netns/generic.h \
@@ -1700,8 +1702,6 @@ deps_a2tp_core.o := \
   /usr/src/linux-headers-7.0.0-30-generic/include/uapi/linux/if_arp.h \
   /usr/src/linux-headers-7.0.0-30-generic/include/net/ndisc.h \
   /usr/src/linux-headers-7.0.0-30-generic/include/net/ipv6_stubs.h \
-  /usr/src/linux-headers-7.0.0-30-generic/include/linux/icmpv6.h \
-    $(wildcard include/config/NF_NAT) \
   /usr/src/linux-headers-7.0.0-30-generic/include/uapi/linux/route.h \
   /usr/src/linux-headers-7.0.0-30-generic/include/net/dst_cache.h \
   /usr/src/linux-headers-7.0.0-30-generic/include/net/ip6_fib.h \
